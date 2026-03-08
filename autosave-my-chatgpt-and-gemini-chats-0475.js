@@ -541,7 +541,7 @@
         }, 1000);
 
         async runFullExtraction(source = 'AUTOSAVE') {
-            if (!this.adapter.healthCheck()) return;
+            if (this.hasFatalDbError || !this.adapter.healthCheck()) return;
 
             let msgs = this.adapter.extractL1();
             if (msgs.length === 0) {
@@ -558,6 +558,7 @@
         }
 
         async processMessage(msgData, source, forcedArchiveOrder = null) {
+            if (this.hasFatalDbError) return { inserted: false, archiveOrder: forcedArchiveOrder };
             if (!msgData.text) return;
 
             const textHash = await Utils.hash(msgData.text);
@@ -999,6 +1000,7 @@
             const scanBtn = this.container.querySelector('#chron-deep-scan');
             const exportBtn = this.container.querySelector('#chron-export');
             const header = this.container.querySelector('#chron-header');
+            const engineSelect = this.container.querySelector('#chron-engine-select');
             
             this.hideError();
 
@@ -1009,12 +1011,14 @@
                 toggle.disabled = true;
                 scanBtn.disabled = true;
                 exportBtn.disabled = true;
+                engineSelect.disabled = true;
             } else if (state === 'ADAPTER MISMATCH') {
                 statusEl.style.color = '#fab387';
                 toggle.checked = false;
                 toggle.disabled = false;
                 scanBtn.disabled = true;
                 exportBtn.disabled = false; // Still allow export
+                engineSelect.disabled = false;
                 this.showError("Health check failed. Autosave blocked.");
             } else if (state === 'DB ERROR') {
                 header.style.background = '#721c24';
@@ -1022,6 +1026,7 @@
                 toggle.disabled = true;
                 scanBtn.disabled = true;
                 exportBtn.disabled = !this.engine.db.canRead();
+                engineSelect.disabled = true;
                 if (errorReason) this.showError(errorReason);
             } else if (state === 'ARCHIVING') {
                 statusEl.style.color = '#a6e3a1';
@@ -1029,6 +1034,7 @@
                 toggle.checked = true;
                 scanBtn.disabled = false;
                 exportBtn.disabled = false;
+                engineSelect.disabled = false;
             } else if (state === 'SAVED') {
                 statusEl.style.color = '#89dceb';
             } else { // IDLE
@@ -1037,6 +1043,7 @@
                 toggle.checked = false;
                 scanBtn.disabled = false;
                 exportBtn.disabled = false;
+                engineSelect.disabled = false;
             }
         }
 
@@ -1409,6 +1416,7 @@
             routeWatcher.start(); // This triggers initial chat ID setup
         } catch (e) {
             console.error("Chronicler DB Error:", e);
+            engine.hasFatalDbError = true;
             engine.onStateChange('DB ERROR', "IndexedDB Error: " + (e.message || "Init Failed"));
         }
     };
