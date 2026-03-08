@@ -488,8 +488,10 @@
             this.runFullExtraction(); // Initial grab
         }
 
-        async stopObserverOnly({ flushPending = true } = {}) {
-            this.onStateChange('IDLE');
+        async stopObserverOnly({ flushPending = true, preserveState = false } = {}) {
+            if (!preserveState) {
+                this.onStateChange('IDLE');
+            }
             if (this.observer) {
                 this.observer.disconnect();
                 this.observer = null;
@@ -673,7 +675,7 @@
             } catch (e) {
                 this.onStateChange('DB ERROR', "Failed to write message: " + e.message);
                 this.isArchiving = false;
-                await this.stopObserverOnly({ flushPending: false }); // Abort archiving without recurse
+                await this.stopObserverOnly({ flushPending: false, preserveState: true }); // Abort archiving without recurse and preserve error state
                 return { inserted: false, archiveOrder: record.archiveOrder };
             }
         }
@@ -1104,27 +1106,6 @@
     }
 
     // ======================================================================
-    // BOOTSTRAP
-    // ======================================================================
-    const bootstrap = async () => {
-        const engine = new Engine(appDb);
-        // We create the UI first so it can handle DB Init errors properly via its state machine
-        const ui = new FloatingUI(engine, () => performExport(engine, ui));
-        ui.init();
-
-        try {
-            await appDb.init();
-            const routeWatcher = new RouteWatcher(engine);
-            routeWatcher.start(); // This triggers initial chat ID setup
-        } catch (e) {
-            console.error("Chronicler DB Error:", e);
-            engine.onStateChange('DB ERROR', "IndexedDB Error: " + (e.message || "Init Failed"));
-        }
-    };
-
-    bootstrap();
-
-    // ======================================================================
     // PLATFORM ADAPTERS
     // ======================================================================
 
@@ -1399,5 +1380,27 @@
                 .trim();
         }
     }
+
+    // ======================================================================
+    // BOOTSTRAP
+    // ======================================================================
+
+    const bootstrap = async () => {
+        const engine = new Engine(appDb);
+        // We create the UI first so it can handle DB Init errors properly via its state machine
+        const ui = new FloatingUI(engine, () => performExport(engine, ui));
+        ui.init();
+
+        try {
+            await appDb.init();
+            const routeWatcher = new RouteWatcher(engine);
+            routeWatcher.start(); // This triggers initial chat ID setup
+        } catch (e) {
+            console.error("Chronicler DB Error:", e);
+            engine.onStateChange('DB ERROR', "IndexedDB Error: " + (e.message || "Init Failed"));
+        }
+    };
+
+    bootstrap();
 
 })();
