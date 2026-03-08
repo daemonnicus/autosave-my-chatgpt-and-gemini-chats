@@ -369,6 +369,7 @@
             this.observer = null;
             this.isArchiving = false;
             this.isScannerActive = false;
+            this.hasFatalDbError = false;
             
             // Streaming Guard
             this.pendingEntry = null; 
@@ -405,6 +406,8 @@
         }
 
         async updateCurrentChatId() {
+            if (this.hasFatalDbError) return;
+
             let id = this.adapter.getChatId();
             
             if (!id) {
@@ -462,6 +465,8 @@
         }
 
         async setArchiveForCurrentChat(enabled) {
+            if (this.hasFatalDbError) return;
+
             if (!this.adapter.healthCheck()) {
                 this.onStateChange('ADAPTER MISMATCH');
                 return;
@@ -479,6 +484,8 @@
         }
 
         startObserverOnly() {
+            if (this.hasFatalDbError) return;
+
             if (!this.adapter.healthCheck()) {
                 this.onStateChange('ADAPTER MISMATCH');
                 return;
@@ -515,7 +522,7 @@
         }
 
         async handleMutations(mutations) {
-            if (!this.isArchiving || this.isScannerActive) return;
+            if (this.hasFatalDbError || !this.isArchiving || this.isScannerActive) return;
 
             // L3 Extraction First
             const l3Updates = this.adapter.extractL3FromMutations(mutations);
@@ -673,6 +680,7 @@
                 }
                 return { inserted: false, archiveOrder: record.archiveOrder };
             } catch (e) {
+                this.hasFatalDbError = true;
                 this.onStateChange('DB ERROR', "Failed to write message: " + e.message);
                 this.isArchiving = false;
                 await this.stopObserverOnly({ flushPending: false, preserveState: true }); // Abort archiving without recurse and preserve error state
@@ -681,6 +689,8 @@
         }
 
         async performDeepScan() {
+            if (this.hasFatalDbError) return;
+
             if (this.pendingEntry) {
                 console.warn("Cannot Deep Scan while assistant is streaming.");
                 return;
@@ -768,11 +778,13 @@
                 this.isScannerActive = false;
                 this.isArchiving = wasArchiving;
                 
-                if (wasArchiving) {
-                    this.setupObserver();
-                    this.onStateChange('ARCHIVING');
-                } else {
-                    this.onStateChange('IDLE');
+                if (!this.hasFatalDbError) {
+                    if (wasArchiving) {
+                        this.setupObserver();
+                        this.onStateChange('ARCHIVING');
+                    } else {
+                        this.onStateChange('IDLE');
+                    }
                 }
                 
                 this.updateStats();
