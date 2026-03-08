@@ -715,6 +715,9 @@
                     const insertedOrders = [];
 
                     if (!Number.isFinite(this.currentMinOrder)) {
+                        this.lastKnownUserHash = '__ROOT__';
+                        this.hasConfirmedUserInCurrentPass = false;
+
                         for (let i = 0; i < n; i++) {
                             const calculatedOrder = (i + 1) * 100;
                             const result = await this.processMessage(msgs[i], 'DEEPSCAN', calculatedOrder);
@@ -730,6 +733,9 @@
                             iterationsWithoutInserts++;
                         }
                     } else {
+                        this.lastKnownUserHash = '__ROOT__';
+                        this.hasConfirmedUserInCurrentPass = false;
+
                         let baseOrder = this.currentMinOrder - (n * 100);
                         for (let i = 0; i < n; i++) {
                             const calculatedOrder = baseOrder + (i * 100);
@@ -936,12 +942,11 @@
             this.container.querySelector('#chron-engine-select').addEventListener('change', (e) => {
                 const val = e.target.value;
                 localStorage.setItem(`ChroniclerEngine_${location.hostname}`, val);
-                const actualName = this.engine.setAdapter(val);
-                this.updateEngineLabel(val, actualName);
-                if (this.engine.isArchiving) {
-                    this.engine.stopObserverOnly();
-                    this.engine.startObserverOnly(); // Restart with new adapter
-                }
+                this.engine.flushPendingEntry('adapter_change').then(async () => {
+                    const actualName = this.engine.setAdapter(val);
+                    this.updateEngineLabel(val, actualName);
+                    await this.engine.updateCurrentChatId();
+                });
             });
 
             this.container.querySelector('#chron-toggle').addEventListener('change', (e) => {
