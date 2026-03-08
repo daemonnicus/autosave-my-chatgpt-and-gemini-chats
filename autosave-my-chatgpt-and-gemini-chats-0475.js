@@ -374,6 +374,7 @@
             this.pendingEntry = null; 
             this.quietTimeout = null;
             this.lastKnownUserHash = '__ROOT__';
+            this.hasConfirmedUserInCurrentPass = false;
 
             // UI Callbacks
             this.onStateChange = () => {};
@@ -426,6 +427,7 @@
 
             this.currentChatId = id;
             this.lastKnownUserHash = '__ROOT__';
+            this.hasConfirmedUserInCurrentPass = false;
             
             // Re-sync order info
             const { min, max } = await this.db.getMinMaxOrder(this.currentChatId);
@@ -537,6 +539,7 @@
 
             // Reset extraction pass context
             this.lastKnownUserHash = '__ROOT__';
+            this.hasConfirmedUserInCurrentPass = false;
 
             for (const msg of msgs) {
                 await this.processMessage(msg, source);
@@ -552,11 +555,16 @@
             if (msgData.role === 'USER') {
                 prevHash = this.lastKnownUserHash; // Point back to previous user msg or ROOT
                 this.lastKnownUserHash = textHash; // Update tail
+                this.hasConfirmedUserInCurrentPass = true;
                 
                 // Finalize any pending assistant response immediately when user speaks
                 await this.flushPendingEntry('user_message');
             } else if (msgData.role === 'ASSISTANT') {
-                prevHash = this.lastKnownUserHash; // Assistant points to preceding user msg
+                if (this.hasConfirmedUserInCurrentPass) {
+                    prevHash = this.lastKnownUserHash;
+                } else {
+                    prevHash = '__UNKNOWN__';
+                }
             }
 
             const variantGroupId = prevHash; 
@@ -602,21 +610,21 @@
             };
 
             if (msgData.role === 'ASSISTANT' && source !== 'DEEPSCAN') {
-                return this.handleStreamingGuard(record);
+                return await this.handleStreamingGuard(record);
             } else {
                 return await this.writeToDB(record);
             }
         }
 
-        handleStreamingGuard(record) {
+        async handleStreamingGuard(record) {
             // If cap doesn't support streaming guard, just write immediately
             if (!this.adapter.getCapabilities().supportsReliableStreamingDetection) {
-                return this.writeToDB(record);
+                return await this.writeToDB(record);
             }
 
             if (this.pendingEntry && this.pendingEntry.nodeSignature !== record.nodeSignature) {
                 // New assistant node appeared! Flush old one explicitly.
-                this.flushPendingEntry('new_node');
+                await this.flushPendingEntry('new_node');
             }
 
             // Update pending node state in memory but do not write to DB yet.
@@ -847,7 +855,7 @@
             this.updateState(this.state);
             this.bindEvents();
             
-            this.engine.onStateChange = (state, err) => this.updateState(state, err);
+            this.engine.onStateChange = (state) => this.updateState(state);
             this.engine.onStatsUpdate = (count) => this.updateStats(count);
             
             // Set initial engine
