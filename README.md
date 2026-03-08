@@ -1,18 +1,18 @@
 Writer's Chat Chronicler (Auto-save for ChatGPT & Gemini)
 Writer’s Chat Chronicler is an MVP of a local archiver. It is designed for authors, screenwriters, and researchers who need a simple way to save their creative dialogues from ChatGPT and Gemini.
 It will add small button to your browser, where you can turn auto-saving chats on\off (saves in .txt to your pc).
-+----------------------------+
-    | 📝 Save-my-chatgpt-and-gemini-chats v0.47   [ _ ] [X] | 
-    +----------------------------+
-    | Engine: [ Auto (Gemini) ▼] | <-- (selector)
-    | Status: [ 🟢 ACTIVE ]       |
-    | [X] Archive this chat      |
-    +----------------------------+
-    | DB Count: [ 142 msgs ]     |
-    +----------------------------+
-    | [ 🔍 Run Deep Scan ]       |
-    | [ 📥 Export to .txt ]      |
-    +----------------------------+
++-----------------------------------------------------------+
+| 📝 Save-my-chatgpt-and-gemini-chats v0.47      [ _ ] [X]  |
++-----------------------------------------------------------+
+| Engine: [ Auto (Gemini) ▼ ] <--- (selector)               |
+| Status: [ 🟢 ACTIVE ]                                     |
+| [X] Archive this chat                                     |
++-----------------------------------------------------------+
+| DB Count: [ 142 msgs ]                                    |
++-----------------------------------------------------------+
+| [ 🔍 Run Deep Scan ]                                      |
+| [ 📥 Export to .txt ]                                     |
++-----------------------------------------------------------+
 
 Concept & Purpose
 The primary goal of this tool is to provide independent backup of your creative dialogues. 
