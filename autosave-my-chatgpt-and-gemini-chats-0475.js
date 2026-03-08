@@ -450,7 +450,7 @@
             if (this.isArchiving) {
                 this.startObserverOnly();
             } else {
-                this.stopObserverOnly();
+                await this.stopObserverOnly();
             }
         }
 
@@ -474,7 +474,7 @@
             if (enabled) {
                 this.startObserverOnly();
             } else {
-                this.stopObserverOnly();
+                await this.stopObserverOnly();
             }
         }
 
@@ -488,13 +488,13 @@
             this.runFullExtraction(); // Initial grab
         }
 
-        stopObserverOnly() {
+        async stopObserverOnly() {
             this.onStateChange('IDLE');
             if (this.observer) {
                 this.observer.disconnect();
                 this.observer = null;
             }
-            this.flushPendingEntry('stop');
+            await this.flushPendingEntry('stop');
         }
 
         setupObserver() {
@@ -670,7 +670,7 @@
                 return { inserted: false, archiveOrder: record.archiveOrder };
             } catch (e) {
                 this.onStateChange('DB ERROR', "Failed to write message: " + e.message);
-                this.stopObserverOnly(); // Abort archiving
+                await this.stopObserverOnly(); // Abort archiving
                 return { inserted: false, archiveOrder: record.archiveOrder };
             }
         }
@@ -1076,12 +1076,12 @@
         // Grouping for variants
         const variantMap = {};
         messages.forEach(m => {
-            if (!variantMap[m.variantGroupId]) variantMap[m.variantGroupId] = [];
-            variantMap[m.variantGroupId].push(m);
+            if (!variantMap[m.variantGroupId]) variantMap[m.variantGroupId] = new Set();
+            variantMap[m.variantGroupId].add(m.variantIndex);
         });
 
         for (const msg of messages) {
-            const hasVariants = variantMap[msg.variantGroupId].length > 1;
+            const hasVariants = msg.variantGroupId !== '__UNKNOWN__' && variantMap[msg.variantGroupId] && variantMap[msg.variantGroupId].size > 1;
             const versionStr = hasVariants ? ` | V${msg.variantIndex}` : '';
             
             content += `[${msg.role}]${versionStr}\n`;
