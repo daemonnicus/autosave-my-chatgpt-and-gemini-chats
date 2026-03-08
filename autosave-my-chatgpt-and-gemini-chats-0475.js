@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         Writer's Chat Chronicler v0.47.1 Final Lock
+// @name         Writer's Chat Chronicler v0.48 Final Lock
 // @namespace    http://tampermonkey.net/
-// @version      0.47.1
+// @version      0.48
 // @description  Local archiver for long-form creative conversations.
 // @match        https://chatgpt.com/*
 // @match        https://gemini.google.com/*
