@@ -488,13 +488,15 @@
             this.runFullExtraction(); // Initial grab
         }
 
-        async stopObserverOnly() {
+        async stopObserverOnly({ flushPending = true } = {}) {
             this.onStateChange('IDLE');
             if (this.observer) {
                 this.observer.disconnect();
                 this.observer = null;
             }
-            await this.flushPendingEntry('stop');
+            if (flushPending) {
+                await this.flushPendingEntry('stop');
+            }
         }
 
         setupObserver() {
@@ -670,7 +672,8 @@
                 return { inserted: false, archiveOrder: record.archiveOrder };
             } catch (e) {
                 this.onStateChange('DB ERROR', "Failed to write message: " + e.message);
-                await this.stopObserverOnly(); // Abort archiving
+                this.isArchiving = false;
+                await this.stopObserverOnly({ flushPending: false }); // Abort archiving without recurse
                 return { inserted: false, archiveOrder: record.archiveOrder };
             }
         }
