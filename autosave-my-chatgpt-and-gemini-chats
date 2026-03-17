@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         Writer's Chat Chronicler v0.48b
+// @name         Writer's Chat Chronicler v0.49e
 // @namespace    http://tampermonkey.net/
-// @version      0.48b
+// @version      0.49e
 // @description  Local archiver for long-form creative conversations.
 // @author       You
 // @match        *://chatgpt.com/*
@@ -127,7 +127,7 @@
     // ======================================================================
     class DB {
         constructor() {
-            this.dbName = 'ChatArchive_v47_1';
+            this.dbName = 'ChatArchive_v47_1'; // Preserved intentionally for compatibility with older archives.
             this.version = 1;
             this.db = null;
         }
@@ -353,6 +353,87 @@
             });
         }
 
+        async deleteChat(chatId) {
+            return new Promise((resolve, reject) => {
+                const tx = this.db.transaction(['messages', 'chats'], 'readwrite');
+                const chatStore = tx.objectStore('chats');
+                const msgStore = tx.objectStore('messages');
+                chatStore.delete(chatId);
+                const index = msgStore.index('chatId');
+                const req = index.openCursor(chatId);
+                req.onsuccess = (e) => {
+                    const cursor = e.target.result;
+                    if (cursor) {
+                        cursor.delete();
+                        cursor.continue();
+                    }
+                };
+                tx.oncomplete = () => resolve();
+                tx.onerror = () => reject(tx.error);
+            });
+        }
+
+        async clearOldArchives(days) {
+            return new Promise((resolve, reject) => {
+                const tx = this.db.transaction(['chats', 'messages'], 'readwrite');
+                const chatStore = tx.objectStore('chats');
+                const msgStore = tx.objectStore('messages');
+                const cutoff = Date.now() - (days * 86400000);
+                const chatsReq = chatStore.getAll();
+                chatsReq.onsuccess = () => {
+                    const chats = chatsReq.result;
+                    let pendingChats = chats.length;
+                    if (pendingChats === 0) { resolve(0); return; }
+                    let deletedCount = 0;
+                    chats.forEach(chat => {
+                        const msgIndex = msgStore.index('chatId');
+                        const msgReq = msgIndex.getAll(chat.chatId);
+                        msgReq.onsuccess = () => {
+                            const messages = msgReq.result;
+                            let maxTimestamp = 0;
+                            messages.forEach(m => {
+                                if (m.captureTimestamp > maxTimestamp) maxTimestamp = m.captureTimestamp;
+                            });
+                            if (maxTimestamp > 0 && maxTimestamp < cutoff) {
+                                chatStore.delete(chat.chatId);
+                                messages.forEach(m => msgStore.delete(m.id));
+                                deletedCount++;
+                            }
+                            pendingChats--;
+                            if (pendingChats === 0) resolve(deletedCount);
+                        };
+                        msgReq.onerror = () => {
+                            pendingChats--;
+                            if (pendingChats === 0) resolve(deletedCount);
+                        }
+                    });
+                };
+                chatsReq.onerror = () => reject(chatsReq.error);
+            });
+        }
+
+        async calculateApproximateSize() {
+            return new Promise((resolve, reject) => {
+                const tx = this.db.transaction('messages', 'readonly');
+                const store = tx.objectStore('messages');
+                const req = store.openCursor();
+                let totalBytes = 0;
+                req.onsuccess = (e) => {
+                    const cursor = e.target.result;
+                    if (cursor) {
+                        const msg = cursor.value;
+                        totalBytes += (msg.text ? msg.text.length : 0);
+                        totalBytes += (msg.role ? msg.role.length : 0);
+                        totalBytes += 100;
+                        cursor.continue();
+                    } else {
+                        resolve(totalBytes);
+                    }
+                };
+                req.onerror = () => reject(req.error);
+            });
+        }
+
         canRead() {
             try {
                 if (!this.db) return false;
@@ -395,6 +476,16 @@
 
             // Strict Variant Hint
             this.pendingVariantHint = null;
+        }
+
+        resetCurrentChatState() {
+            this.pendingEntry = null;
+            this.lastKnownUserHash = '__ROOT__';
+            this.hasConfirmedUserInCurrentPass = false;
+            this.currentMaxOrder = 0;
+            this.currentMinOrder = Infinity;
+            this.pendingVariantHint = null;
+            this.onStatsUpdate(0);
         }
 
         setAdapter(adapterName) {
@@ -699,6 +790,7 @@
 
         async performDeepScan() {
             if (this.hasFatalDbError) return;
+            if (this.isScannerActive) return;
 
             if (this.pendingEntry) {
                 console.warn("Cannot Deep Scan while assistant is streaming.");
@@ -876,11 +968,16 @@
     // FLOATING UI & STATE MACHINE
     // ======================================================================
     class FloatingUI {
-        constructor(engine, performExport) {
+        constructor(engine, performExport, performMarkdownExport, performJsonExport, performPartExport, performCopyAll) {
             this.engine = engine;
             this.performExport = performExport;
+            this.performMarkdownExport = performMarkdownExport;
+            this.performJsonExport = performJsonExport;
+            this.performPartExport = performPartExport;
+            this.performCopyAll = performCopyAll;
             this.container = null;
             this.state = 'IDLE';
+            this.currentMsgCount = 0;
             this.isCollapsed = localStorage.getItem('ChroniclerCollapsed') === 'true';
             this.savedOverride = localStorage.getItem(`ChroniclerEngine_${location.hostname}`) || 'Auto';
         }
@@ -1005,25 +1102,88 @@
 
             const row3 = make('div', { style: { marginBottom: '10px' } }, [
                 make('span', { text: 'Messages in DB: ' }, [
-                    make('strong', { id: 'chron-count', text: '0', style: { color: '#f9e2af' } })
+                    make('strong', { id: 'chron-count', text: '0', style: { color: '#f9e2af' } }),
+                    make('span', { id: 'chron-size', text: ' (0 MB)', style: { color: '#a6adc8', fontSize: '11px', marginLeft: '5px' } })
                 ])
             ]);
 
-            const row4 = make('div', { style: { display: 'flex', gap: '5px' } }, [
+            const row4 = make('div', { style: { display: 'flex', gap: '5px', marginBottom: '5px' } }, [
                 make('button', {
                     id: 'chron-deep-scan',
                     text: 'Deep Scan',
+                    title: 'Запустить глубокое сканирование страницы',
                     style: {
                         flex: '1', background: '#89b4fa', color: '#11111b', border: 'none',
                         padding: '6px', borderRadius: '4px', cursor: 'pointer', fontWeight: 'bold'
                     }
                 }),
                 make('button', {
+                    id: 'chron-copy-all',
+                    text: 'Copy All',
+                    title: 'Скопировать весь чат в буфер обмена',
+                    style: {
+                        flex: '1', background: '#f9e2af', color: '#11111b', border: 'none',
+                        padding: '6px', borderRadius: '4px', cursor: 'pointer', fontWeight: 'bold'
+                    }
+                })
+            ]);
+
+            const row5 = make('div', { style: { display: 'flex', gap: '5px', marginBottom: '10px' } }, [
+                make('button', {
                     id: 'chron-export',
                     text: 'Export .txt',
+                    title: 'Экспорт в обычном текстовом формате',
                     style: {
                         flex: '1', background: '#a6e3a1', color: '#11111b', border: 'none',
-                        padding: '6px', borderRadius: '4px', cursor: 'pointer', fontWeight: 'bold'
+                        padding: '4px', borderRadius: '4px', cursor: 'pointer', fontSize: '11px'
+                    }
+                }),
+                make('button', {
+                    id: 'chron-export-md',
+                    text: 'Export .md',
+                    title: 'Экспорт в Markdown',
+                    style: {
+                        flex: '1', background: '#a6e3a1', color: '#11111b', border: 'none',
+                        padding: '4px', borderRadius: '4px', cursor: 'pointer', fontSize: '11px'
+                    }
+                }),
+                make('button', {
+                    id: 'chron-export-json',
+                    text: 'Export .json',
+                    title: 'Экспорт в JSON формате',
+                    style: {
+                        flex: '1', background: '#a6e3a1', color: '#11111b', border: 'none',
+                        padding: '4px', borderRadius: '4px', cursor: 'pointer', fontSize: '11px'
+                    }
+                }),
+                make('button', {
+                    id: 'chron-export-parts',
+                    text: 'Parts',
+                    title: 'Экспорт длинного чата по частям',
+                    style: {
+                        flex: '0.8', background: '#a6e3a1', color: '#11111b', border: 'none',
+                        padding: '4px', borderRadius: '4px', cursor: 'pointer', fontSize: '11px'
+                    }
+                })
+            ]);
+
+            const row6 = make('div', { style: { display: 'flex', gap: '5px' } }, [
+                make('button', {
+                    id: 'chron-del-chat',
+                    text: '🗑️ Текущий чат',
+                    title: 'Удалить текущий чат из базы',
+                    style: {
+                        flex: '1', background: '#f38ba8', color: '#11111b', border: 'none',
+                        padding: '4px', borderRadius: '4px', cursor: 'pointer', fontSize: '11px'
+                    }
+                }),
+                make('button', {
+                    id: 'chron-del-old',
+                    text: '🗑️ Старые (>30д)',
+                    title: 'Стереть архивы старше 30 дней',
+                    style: {
+                        flex: '1', background: '#f38ba8', color: '#11111b', border: 'none',
+                        padding: '4px', borderRadius: '4px', cursor: 'pointer', fontSize: '11px'
                     }
                 })
             ]);
@@ -1033,7 +1193,7 @@
                 style: { color: '#f38ba8', marginTop: '8px', fontSize: '11px', display: 'none' }
             });
 
-            body.append(row1, row2, row3, row4, error);
+            body.append(row1, row2, row3, row4, row5, row6, error);
             this.container.append(header, body);
 
             const mountPoint = document.body || document.documentElement;
@@ -1087,6 +1247,58 @@
             this.container.querySelector('#chron-export').addEventListener('click', () => {
                 this.performExport();
             });
+
+            this.container.querySelector('#chron-export-md').addEventListener('click', () => {
+                this.performMarkdownExport();
+            });
+            this.container.querySelector('#chron-export-json').addEventListener('click', () => {
+                this.performJsonExport();
+            });
+            this.container.querySelector('#chron-export-parts').addEventListener('click', () => {
+                this.performPartExport();
+            });
+            this.container.querySelector('#chron-copy-all').addEventListener('click', (e) => {
+                this.performCopyAll(e.target);
+            });
+
+            this.container.querySelector('#chron-del-chat').addEventListener('click', async () => {
+                if (!this.engine.currentChatId) return;
+                if (window.confirm('Удалить архив текущего чата?')) {
+                    if (this.engine.isArchiving) {
+                        await this.engine.setArchiveForCurrentChat(false);
+                    }
+                    this.container.querySelector('#chron-toggle').checked = false;
+
+                    await this.engine.flushPendingEntry('delete_chat');
+
+                    const deletedId = this.engine.currentChatId;
+                    await appDb.deleteChat(deletedId);
+                    this.engine.resetCurrentChatState();
+
+                    await this.engine.updateCurrentChatId();
+                }
+            });
+
+            this.container.querySelector('#chron-del-old').addEventListener('click', async () => {
+                await this.engine.flushPendingEntry('delete_old');
+                if (window.confirm('Удалить архивы старше 30 дней (по дате последнего сообщения)?')) {
+                    const deleted = await appDb.clearOldArchives(30);
+                    if (this.engine.currentChatId) {
+                         const currentChat = await appDb.getChat(this.engine.currentChatId);
+                         if (!currentChat) {
+                             if (this.engine.isArchiving) {
+                                  await this.engine.setArchiveForCurrentChat(false);
+                             }
+                             this.container.querySelector('#chron-toggle').checked = false;
+                             this.engine.resetCurrentChatState();
+                             await this.engine.updateCurrentChatId();
+                         } else {
+                             await this.engine.updateCurrentChatId();
+                         }
+                    }
+                    this.showError(`Удалено архивов: ${deleted}`);
+                }
+            });
         }
 
         updateEngineLabel(override, actual) {
@@ -1100,6 +1312,12 @@
             const toggle = this.container.querySelector('#chron-toggle');
             const scanBtn = this.container.querySelector('#chron-deep-scan');
             const exportBtn = this.container.querySelector('#chron-export');
+            const exportMdBtn = this.container.querySelector('#chron-export-md');
+            const exportJsonBtn = this.container.querySelector('#chron-export-json');
+            const exportPartsBtn = this.container.querySelector('#chron-export-parts');
+            const copyAllBtn = this.container.querySelector('#chron-copy-all');
+            const delChatBtn = this.container.querySelector('#chron-del-chat');
+            const delOldBtn = this.container.querySelector('#chron-del-old');
             const header = this.container.querySelector('#chron-header');
             const engineSelect = this.container.querySelector('#chron-engine-select');
 
@@ -1107,49 +1325,100 @@
 
             statusEl.innerText = state;
 
+            const disableAllActions = (disabled) => {
+                scanBtn.disabled = disabled && state !== 'SCANNING';
+                if (state === 'SCANNING' || state.startsWith('SCANNING')) {
+                    scanBtn.disabled = true;
+                }
+
+                const noChatOrEmpty = !this.engine.currentChatId || this.currentMsgCount === 0;
+
+                exportBtn.disabled = disabled || noChatOrEmpty;
+                exportMdBtn.disabled = disabled || noChatOrEmpty;
+                exportJsonBtn.disabled = disabled || noChatOrEmpty;
+                exportPartsBtn.disabled = disabled || noChatOrEmpty;
+                copyAllBtn.disabled = disabled || noChatOrEmpty;
+                delChatBtn.disabled = disabled || noChatOrEmpty;
+
+                delOldBtn.disabled = disabled;
+            };
+
             if (state.startsWith('SCANNING')) {
                 statusEl.style.color = '#f9e2af';
                 toggle.disabled = true;
-                scanBtn.disabled = !this.engine.adapter.getCapabilities().supportsDeepScan;
-                exportBtn.disabled = true;
+                disableAllActions(true);
                 engineSelect.disabled = true;
             } else if (state === 'ADAPTER MISMATCH') {
                 statusEl.style.color = '#fab387';
                 toggle.checked = false;
                 toggle.disabled = false;
                 scanBtn.disabled = true;
-                exportBtn.disabled = false; // Still allow export
+
+                // Keep exports available if DB is readable, otherwise disable
+                const canRead = this.engine.db.canRead();
+                const noChatOrEmpty = !this.engine.currentChatId || this.currentMsgCount === 0;
+                exportBtn.disabled = !canRead || noChatOrEmpty;
+                exportMdBtn.disabled = !canRead || noChatOrEmpty;
+                exportJsonBtn.disabled = !canRead || noChatOrEmpty;
+                exportPartsBtn.disabled = !canRead || noChatOrEmpty;
+                copyAllBtn.disabled = !canRead || noChatOrEmpty;
+                delChatBtn.disabled = !canRead || noChatOrEmpty;
+                delOldBtn.disabled = !canRead;
+
                 engineSelect.disabled = false;
                 this.showError("Health check failed. Autosave blocked.");
             } else if (state === 'DB ERROR') {
                 header.style.background = '#721c24';
                 statusEl.style.color = '#f38ba8';
                 toggle.disabled = true;
-                scanBtn.disabled = true;
-                exportBtn.disabled = !this.engine.db.canRead();
+                disableAllActions(true);
+                // Specifically allow reading if possible even in error state
+                const canRead = this.engine.db.canRead();
+                const noChatOrEmpty = !this.engine.currentChatId || this.currentMsgCount === 0;
+                if (canRead) {
+                   exportBtn.disabled = noChatOrEmpty;
+                   exportMdBtn.disabled = noChatOrEmpty;
+                   exportJsonBtn.disabled = noChatOrEmpty;
+                   exportPartsBtn.disabled = noChatOrEmpty;
+                   copyAllBtn.disabled = noChatOrEmpty;
+                   delChatBtn.disabled = noChatOrEmpty;
+                   delOldBtn.disabled = false;
+                }
+
                 engineSelect.disabled = true;
                 if (errorReason) this.showError(errorReason);
             } else if (state === 'ARCHIVING') {
                 statusEl.style.color = '#a6e3a1';
                 toggle.disabled = false;
                 toggle.checked = true;
-                scanBtn.disabled = false;
-                exportBtn.disabled = false;
+                disableAllActions(false);
                 engineSelect.disabled = false;
             } else if (state === 'SAVED') {
                 statusEl.style.color = '#89dceb';
+                disableAllActions(false);
             } else { // IDLE
                 statusEl.style.color = '#89b4fa';
                 toggle.disabled = false;
                 toggle.checked = false;
-                scanBtn.disabled = false;
-                exportBtn.disabled = false;
+                disableAllActions(false);
                 engineSelect.disabled = false;
             }
         }
 
         updateStats(count) {
             this.container.querySelector('#chron-count').innerText = count;
+            this.currentMsgCount = count;
+            this.updateState(this.state);
+            this.updateDbSize();
+        }
+
+        async updateDbSize() {
+            try {
+                const bytes = await appDb.calculateApproximateSize();
+                const mb = (bytes / (1024 * 1024)).toFixed(2);
+                const sizeEl = this.container.querySelector('#chron-size');
+                if (sizeEl) sizeEl.innerText = ` (${mb} MB)`;
+            } catch(e) { console.error(e); }
         }
 
         showError(msg) {
@@ -1168,6 +1437,7 @@
     // EXPORT SYSTEM
     // ======================================================================
     async function performExport(engine, ui) {
+        await engine.flushPendingEntry('export');
         if (!engine.currentChatId) {
             ui.showError('No chat ID detected.');
             return;
@@ -1223,6 +1493,229 @@
         a.click();
         document.body.removeChild(a);
         URL.revokeObjectURL(url);
+    }
+
+    async function performMarkdownExport(engine, ui) {
+        await engine.flushPendingEntry('export_md');
+        if (!engine.currentChatId) {
+            ui.showError('No chat ID detected.');
+            return;
+        }
+
+        const chat = await appDb.getChat(engine.currentChatId);
+        const messages = await appDb.getMessages(engine.currentChatId);
+
+        if (messages.length === 0) {
+            ui.showError('Archive is empty. Enable archiving or run Deep Scan.');
+            return;
+        }
+
+        messages.sort((a, b) => a.archiveOrder - b.archiveOrder);
+
+        const safeTitle = Utils.cleanTitle(chat ? chat.title : document.title);
+        const shortId = engine.currentChatId.substring(0, 6);
+        const dateStr = Utils.formatDate();
+        const platform = location.hostname.includes('chatgpt.com') ? 'ChatGPT' : 'Gemini';
+
+        const filename = `Archive_${platform}_${safeTitle}_${dateStr}_${shortId}.md`;
+
+        let content = `# ${chat ? chat.title : document.title}\n\n`;
+        content += `**URL:** ${chat ? chat.lastKnownUrl : location.href}\n`;
+        content += `**Export Date:** ${new Date().toLocaleString()}\n`;
+        content += `**Message Count:** ${messages.length}\n\n`;
+
+        for (const msg of messages) {
+            const d = new Date(msg.captureTimestamp);
+            const hh = String(d.getHours()).padStart(2, '0');
+            const mm = String(d.getMinutes()).padStart(2, '0');
+            const timeStr = `${hh}:${mm}`;
+
+            content += `**[${msg.role}]** (${timeStr}):\n`;
+            content += `${msg.text}\n\n`;
+        }
+
+        const blob = new Blob([content], { type: 'text/markdown;charset=utf-8' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = filename;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+    }
+
+    async function performJsonExport(engine, ui) {
+        await engine.flushPendingEntry('export_json');
+        if (!engine.currentChatId) {
+            ui.showError('No chat ID detected.');
+            return;
+        }
+
+        const chat = await appDb.getChat(engine.currentChatId);
+        const messages = await appDb.getMessages(engine.currentChatId);
+
+        if (messages.length === 0) {
+            ui.showError('Archive is empty. Enable archiving or run Deep Scan.');
+            return;
+        }
+
+        messages.sort((a, b) => a.archiveOrder - b.archiveOrder);
+
+        const platform = location.hostname.includes('chatgpt.com') ? 'ChatGPT' : 'Gemini';
+        const exportedAt = new Date().toISOString();
+
+        const schema = {
+            version: "0.49e",
+            platform: platform,
+            chatId: engine.currentChatId,
+            title: chat ? chat.title : document.title,
+            url: chat ? chat.lastKnownUrl : location.href,
+            exportedAt: exportedAt,
+            messageCount: messages.length,
+            messages: messages.map(m => ({
+                role: m.role,
+                text: m.text,
+                timestamp: new Date(m.captureTimestamp).toISOString(),
+                archiveOrder: m.archiveOrder,
+                variantIndex: m.variantIndex
+            }))
+        };
+
+        const safeTitle = Utils.cleanTitle(chat ? chat.title : document.title);
+        const shortId = engine.currentChatId.substring(0, 6);
+        const dateStr = Utils.formatDate();
+        const filename = `Archive_${platform}_${safeTitle}_${dateStr}_${shortId}.json`;
+
+        const blob = new Blob([JSON.stringify(schema, null, 2)], { type: 'application/json;charset=utf-8' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = filename;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+    }
+
+    async function performPartExport(engine, ui) {
+        await engine.flushPendingEntry('export_parts');
+        if (!engine.currentChatId) {
+            ui.showError('No chat ID detected.');
+            return;
+        }
+
+        const chat = await appDb.getChat(engine.currentChatId);
+        const messages = await appDb.getMessages(engine.currentChatId);
+
+        if (messages.length === 0) {
+            ui.showError('Archive is empty. Enable archiving or run Deep Scan.');
+            return;
+        }
+
+        messages.sort((a, b) => a.archiveOrder - b.archiveOrder);
+
+        const variantMap = {};
+        messages.forEach(m => {
+            if (!variantMap[m.variantGroupId]) variantMap[m.variantGroupId] = new Set();
+            variantMap[m.variantGroupId].add(m.variantIndex);
+        });
+
+        const safeTitle = Utils.cleanTitle(chat ? chat.title : document.title);
+        const shortId = engine.currentChatId.substring(0, 6);
+        const dateStr = Utils.formatDate();
+        const platform = location.hostname.includes('chatgpt.com') ? 'ChatGPT' : 'Gemini';
+
+        const CHUNK_SIZE = 200;
+        const totalChunks = Math.ceil(messages.length / CHUNK_SIZE);
+
+        for (let i = 0; i < totalChunks; i++) {
+            const chunk = messages.slice(i * CHUNK_SIZE, (i + 1) * CHUNK_SIZE);
+            const partNum = i + 1;
+            const filename = `Archive_${platform}_${safeTitle}_${dateStr}_${shortId}_part${partNum}.txt`;
+
+            let content = `======================================================================\n`;
+            content += `TITLE: ${chat ? chat.title : document.title} (Part ${partNum}/${totalChunks})\n`;
+            content += `URL: ${chat ? chat.lastKnownUrl : location.href}\n`;
+            content += `EXPORT DATE: ${new Date().toLocaleString()}\n`;
+            content += `MESSAGE COUNT: ${chunk.length}\n`;
+            content += `======================================================================\n\n`;
+
+            for (const msg of chunk) {
+                const hasVariants = msg.variantGroupId !== '__UNKNOWN__' && variantMap[msg.variantGroupId] && variantMap[msg.variantGroupId].size > 1;
+                const versionStr = hasVariants ? ` | V${msg.variantIndex}` : '';
+
+                content += `[${msg.role}]${versionStr}\n`;
+                content += `${msg.text}\n\n`;
+                content += `----------------------------------------------------------------------\n\n`;
+            }
+
+            const blob = new Blob([content], { type: 'text/plain;charset=utf-8' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = filename;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+
+            // small delay to avoid browser blocking multiple downloads
+            await new Promise(r => setTimeout(r, 300));
+        }
+    }
+
+    async function performCopyAll(engine, ui, buttonEl) {
+        await engine.flushPendingEntry('copy_all');
+        if (!engine.currentChatId) {
+            ui.showError('No chat ID detected.');
+            return;
+        }
+
+        const chat = await appDb.getChat(engine.currentChatId);
+        const messages = await appDb.getMessages(engine.currentChatId);
+
+        if (messages.length === 0) {
+            ui.showError('Archive is empty.');
+            return;
+        }
+
+        messages.sort((a, b) => a.archiveOrder - b.archiveOrder);
+
+        const variantMap = {};
+        messages.forEach(m => {
+            if (!variantMap[m.variantGroupId]) variantMap[m.variantGroupId] = new Set();
+            variantMap[m.variantGroupId].add(m.variantIndex);
+        });
+
+        let content = `======================================================================\n`;
+        content += `TITLE: ${chat ? chat.title : document.title}\n`;
+        content += `URL: ${chat ? chat.lastKnownUrl : location.href}\n`;
+        content += `EXPORT DATE: ${new Date().toLocaleString()}\n`;
+        content += `MESSAGE COUNT: ${messages.length}\n`;
+        content += `======================================================================\n\n`;
+
+        for (const msg of messages) {
+            const hasVariants = msg.variantGroupId !== '__UNKNOWN__' && variantMap[msg.variantGroupId] && variantMap[msg.variantGroupId].size > 1;
+            const versionStr = hasVariants ? ` | V${msg.variantIndex}` : '';
+
+            content += `[${msg.role}]${versionStr}\n`;
+            content += `${msg.text}\n\n`;
+            content += `----------------------------------------------------------------------\n\n`;
+        }
+
+        try {
+            await navigator.clipboard.writeText(content);
+            const originalText = buttonEl.innerText;
+            buttonEl.innerText = "Copied!";
+            buttonEl.style.background = "#a6e3a1";
+            setTimeout(() => {
+                buttonEl.innerText = originalText;
+                buttonEl.style.background = "#f9e2af";
+            }, 2000);
+        } catch (e) {
+            ui.showError("Failed to copy limit or block");
+        }
     }
 
     // ======================================================================
@@ -1497,7 +1990,13 @@
     const bootstrap = async () => {
         const engine = new Engine(appDb);
         // We create the UI first so it can handle DB Init errors properly via its state machine
-        const ui = new FloatingUI(engine, () => performExport(engine, ui));
+        const ui = new FloatingUI(engine,
+            () => performExport(engine, ui),
+            () => performMarkdownExport(engine, ui),
+            () => performJsonExport(engine, ui),
+            () => performPartExport(engine, ui),
+            (btn) => performCopyAll(engine, ui, btn)
+        );
         ui.init();
 
         try {
