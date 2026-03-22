@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         Writer's Chat Chronicler v0.49e
+// @name         Writer's Chat Chronicler v0.51
 // @namespace    http://tampermonkey.net/
-// @version      0.49e
+// @version      0.51
 // @description  Local archiver for long-form creative conversations.
 // @author       You
 // @match        *://chatgpt.com/*
@@ -14,30 +14,27 @@
 // @noframes
 // ==/UserScript==
 
-(function() {
+(function () {
     'use strict';
 
-    console.log('[Chronicler] loaded on', location.href);
+    console.log('[Chronicler 0.51] loaded on', location.href);
 
-    // ======================================================================
-    // CORE UTILS
-    // ======================================================================
     const Utils = {
         async hash(string) {
             const encoder = new TextEncoder();
-            const data = encoder.encode(string);
+            const data = encoder.encode(String(string || ''));
             const hashBuffer = await crypto.subtle.digest('SHA-256', data);
             const hashArray = Array.from(new Uint8Array(hashBuffer));
-            return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+            return hashArray.map((b) => b.toString(16).padStart(2, '0')).join('');
         },
 
         cleanTitle(title) {
             if (!title) return 'Untitled';
             return title
-                .replace(/[\\/:*?"<>|]/g, '') // Remove invalid FS chars
-                .replace(/\s+/g, '_') // Replace spaces with underscores
-                .substring(0, 50) // Truncate long titles
-                .replace(/_+$/, ''); // Trim trailing underscores
+                .replace(/[\\/:*?"<>|]/g, '')
+                .replace(/\s+/g, '_')
+                .substring(0, 50)
+                .replace(/_+$/g, '');
         },
 
         formatDate() {
@@ -48,65 +45,8 @@
             return `${yyyy}-${mm}-${dd}`;
         },
 
-        normalizeText(element) {
-            if (!element) return '';
-
-            // Clone to avoid modifying the real DOM
-            const clone = element.cloneNode(true);
-
-            // Remove common UI garbage via known classes or roles
-            const garbageSelectors = [
-                'button',
-                '[role="button"]',
-                'svg',
-                'img',
-                '.copy-button',
-                '.read-aloud',
-                '.regenerate-button',
-                '[aria-label*="Copy"]',
-                '[aria-label*="Regenerate"]',
-                '[aria-label*="Read aloud"]'
-            ];
-
-            clone.querySelectorAll(garbageSelectors.join(',')).forEach(el => el.remove());
-
-            // Extract text preserving line breaks and blocks
-            let text = '';
-
-            const traverse = (node) => {
-                if (node.nodeType === Node.TEXT_NODE) {
-                    text += node.textContent;
-                } else if (node.nodeType === Node.ELEMENT_NODE) {
-                    const tag = node.tagName.toLowerCase();
-                    const isBlock = ['p', 'div', 'br', 'li', 'pre', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'blockquote'].includes(tag);
-
-                    if (tag === 'br') {
-                        text += '\n';
-                    } else if (isBlock && text.length > 0 && !text.endsWith('\n')) {
-                        text += '\n';
-                    }
-
-                    if (tag === 'li') {
-                        text += '- ';
-                    } else if (tag === 'pre' || tag === 'code') {
-                        // Preserve formatting inside code blocks better if possible,
-                        // but simple traversal works well enough for text extraction.
-                    }
-
-                    node.childNodes.forEach(traverse);
-
-                    if (isBlock && !text.endsWith('\n')) {
-                        text += '\n';
-                    }
-                }
-            };
-
-            traverse(clone);
-
-            // Collapse excessive newlines
-            return text
-                .replace(/\n{3,}/g, '\n\n')
-                .trim();
+        sleep(ms) {
+            return new Promise((resolve) => setTimeout(resolve, ms));
         },
 
         debounce(func, wait) {
@@ -119,15 +59,80 @@
                 clearTimeout(timeout);
                 timeout = setTimeout(later, wait);
             };
+        },
+
+        normalizeText(element) {
+            if (!element) return '';
+
+            const clone = element.cloneNode(true);
+            const garbageSelectors = [
+                'button',
+                '[role="button"]',
+                'svg',
+                'img',
+                'canvas',
+                '.copy-button',
+                '.read-aloud',
+                '.regenerate-button',
+                '[aria-label*="Copy"]',
+                '[aria-label*="Regenerate"]',
+                '[aria-label*="Read aloud"]',
+                '[aria-label*="Good response"]',
+                '[aria-label*="Bad response"]'
+            ];
+
+            clone.querySelectorAll(garbageSelectors.join(',')).forEach((el) => el.remove());
+
+            let text = '';
+            const traverse = (node) => {
+                if (node.nodeType === Node.TEXT_NODE) {
+                    text += node.textContent;
+                    return;
+                }
+
+                if (node.nodeType !== Node.ELEMENT_NODE) return;
+
+                const tag = node.tagName.toLowerCase();
+                const isBlock = ['p', 'div', 'section', 'article', 'br', 'li', 'pre', 'code', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'blockquote'].includes(tag);
+
+                if (tag === 'br') {
+                    text += '\n';
+                    return;
+                }
+
+                if (isBlock && text.length > 0 && !text.endsWith('\n')) {
+                    text += '\n';
+                }
+
+                if (tag === 'li') text += '- ';
+                if (tag === 'pre') text += '```\n';
+
+                node.childNodes.forEach(traverse);
+
+                if (tag === 'pre') {
+                    if (!text.endsWith('\n')) text += '\n';
+                    text += '```\n';
+                    return;
+                }
+
+                if (isBlock && !text.endsWith('\n')) {
+                    text += '\n';
+                }
+            };
+
+            traverse(clone);
+
+            return text
+                .replace(/\u00a0/g, ' ')
+                .replace(/[ \t]+\n/g, '\n')
+                .replace(/\n{3,}/g, '\n\n')
+                .trim();
         }
     };
 
-    // ======================================================================
-    // INDEXEDDB LAYER
-    // ======================================================================
     class DB {
         constructor() {
-            this.dbName = 'ChatArchive_v47_1'; // Preserved intentionally for compatibility with older archives.
+            this.dbName = 'ChatArchive_v47_1';
             this.version = 1;
             this.db = null;
         }
@@ -135,7 +140,6 @@
         async init() {
             return new Promise((resolve, reject) => {
                 const request = indexedDB.open(this.dbName, this.version);
-
                 request.onupgradeneeded = (e) => {
                     const db = e.target.result;
                     if (!db.objectStoreNames.contains('chats')) {
@@ -148,12 +152,10 @@
                         msgStore.createIndex('chatId_archiveOrder', ['chatId', 'archiveOrder'], { unique: false });
                     }
                 };
-
                 request.onsuccess = (e) => {
                     this.db = e.target.result;
                     resolve();
                 };
-
                 request.onerror = (e) => reject(e.target.error);
             });
         }
@@ -164,27 +166,6 @@
                 const store = tx.objectStore('chats');
                 const req = store.get(chatId);
                 req.onsuccess = () => resolve(req.result);
-                req.onerror = () => reject(req.error);
-            });
-        }
-
-        async getHighestVariantIndex(chatId, variantGroupId) {
-            return new Promise((resolve, reject) => {
-                const tx = this.db.transaction('messages', 'readonly');
-                const store = tx.objectStore('messages');
-                const index = store.index('chatId'); // fallback index since we don't have variantGroupId index
-                const req = index.getAll(chatId);
-
-                req.onsuccess = () => {
-                    const messages = req.result;
-                    let maxIndex = 0;
-                    for (const msg of messages) {
-                        if (msg.variantGroupId === variantGroupId && msg.variantIndex > maxIndex) {
-                            maxIndex = msg.variantIndex;
-                        }
-                    }
-                    resolve(maxIndex);
-                };
                 req.onerror = () => reject(req.error);
             });
         }
@@ -215,15 +196,35 @@
             });
         }
 
+        async getHighestVariantIndex(chatId, variantGroupId, role) {
+            return new Promise((resolve, reject) => {
+                const tx = this.db.transaction('messages', 'readonly');
+                const store = tx.objectStore('messages');
+                const index = store.index('chatId');
+                const req = index.getAll(chatId);
+                req.onsuccess = () => {
+                    const messages = req.result;
+                    let maxIndex = 0;
+                    for (const msg of messages) {
+                        if (msg.variantGroupId === variantGroupId && msg.role === role && msg.variantIndex > maxIndex) {
+                            maxIndex = msg.variantIndex;
+                        }
+                    }
+                    resolve(maxIndex);
+                };
+                req.onerror = () => reject(req.error);
+            });
+        }
+
         async saveMessage(msg) {
             return new Promise((resolve, reject) => {
                 const tx = this.db.transaction(['messages', 'chats'], 'readwrite');
                 const msgStore = tx.objectStore('messages');
+                const chatStore = tx.objectStore('chats');
 
-                const proceedToPut = (finalMsg) => {
+                const finalize = (finalMsg) => {
                     const putReq = msgStore.put(finalMsg);
                     putReq.onsuccess = () => {
-                        const chatStore = tx.objectStore('chats');
                         const chatReq = chatStore.get(finalMsg.chatId);
                         chatReq.onsuccess = () => {
                             const chat = chatReq.result || {
@@ -242,9 +243,9 @@
                         resolve(putReq.result);
                     };
                     putReq.onerror = (e) => {
-                        if (e.target.error.name === 'ConstraintError') {
+                        if (e.target.error && e.target.error.name === 'ConstraintError') {
                             e.preventDefault();
-                            resolve(null); // Deduplicated naturally
+                            resolve(null);
                         } else {
                             reject(e.target.error);
                         }
@@ -256,14 +257,12 @@
                     const req = msgStore.index('dedupKey').get(unknownDedupKey);
                     req.onsuccess = () => {
                         let finalMsg = msg;
-                        if (req.result) {
-                            finalMsg = { ...req.result, ...msg, id: req.result.id };
-                        }
-                        proceedToPut(finalMsg);
+                        if (req.result) finalMsg = { ...req.result, ...msg, id: req.result.id };
+                        finalize(finalMsg);
                     };
                     req.onerror = () => reject(req.error);
                 } else {
-                    proceedToPut(msg);
+                    finalize(msg);
                 }
             });
         }
@@ -284,34 +283,28 @@
                 const tx = this.db.transaction('messages', 'readonly');
                 const index = tx.objectStore('messages').index('chatId_archiveOrder');
                 const range = IDBKeyRange.bound([chatId, -Infinity], [chatId, Infinity]);
-
                 const minReq = index.openCursor(range, 'next');
                 const maxReq = index.openCursor(range, 'prev');
-
                 let min = null;
                 let max = null;
-
                 minReq.onsuccess = (e) => {
                     if (e.target.result) min = e.target.result.value.archiveOrder;
                 };
                 maxReq.onsuccess = (e) => {
                     if (e.target.result) max = e.target.result.value.archiveOrder;
                 };
-
                 tx.oncomplete = () => resolve({ min, max });
                 tx.onerror = () => reject(tx.error);
             });
         }
 
         async migrateChatId(oldId, newId) {
-            if (oldId === newId) return;
+            if (!oldId || !newId || oldId === newId) return;
             return new Promise((resolve, reject) => {
                 const tx = this.db.transaction(['messages', 'chats'], 'readwrite');
                 const msgStore = tx.objectStore('messages');
                 const chatStore = tx.objectStore('chats');
 
-
-                // Migrate metadata
                 const oldChatReq = chatStore.get(oldId);
                 oldChatReq.onsuccess = () => {
                     if (oldChatReq.result) {
@@ -327,7 +320,6 @@
                     }
                 };
 
-                // Migrate messages
                 const index = msgStore.index('chatId');
                 const cursorReq = index.openCursor(oldId);
                 cursorReq.onsuccess = (e) => {
@@ -336,11 +328,10 @@
                         const msg = cursor.value;
                         msg.chatId = newId;
                         msg.dedupKey = `${newId}:${msg.role}:${msg.textHash}:${msg.prevHash}:${msg.variantIndex}`;
-
                         const updateReq = cursor.update(msg);
                         updateReq.onerror = (err) => {
-                            if (err.target.error.name === 'ConstraintError') {
-                                err.preventDefault(); // Duplicate exists in new chat, drop the old one
+                            if (err.target.error && err.target.error.name === 'ConstraintError') {
+                                err.preventDefault();
                                 cursor.delete();
                             }
                         };
@@ -378,34 +369,36 @@
                 const tx = this.db.transaction(['chats', 'messages'], 'readwrite');
                 const chatStore = tx.objectStore('chats');
                 const msgStore = tx.objectStore('messages');
-                const cutoff = Date.now() - (days * 86400000);
+                const cutoff = Date.now() - days * 86400000;
                 const chatsReq = chatStore.getAll();
                 chatsReq.onsuccess = () => {
                     const chats = chatsReq.result;
                     let pendingChats = chats.length;
-                    if (pendingChats === 0) { resolve(0); return; }
+                    if (pendingChats === 0) {
+                        resolve(0);
+                        return;
+                    }
                     let deletedCount = 0;
-                    chats.forEach(chat => {
-                        const msgIndex = msgStore.index('chatId');
-                        const msgReq = msgIndex.getAll(chat.chatId);
+                    chats.forEach((chat) => {
+                        const msgReq = msgStore.index('chatId').getAll(chat.chatId);
                         msgReq.onsuccess = () => {
                             const messages = msgReq.result;
                             let maxTimestamp = 0;
-                            messages.forEach(m => {
+                            messages.forEach((m) => {
                                 if (m.captureTimestamp > maxTimestamp) maxTimestamp = m.captureTimestamp;
                             });
                             if (maxTimestamp > 0 && maxTimestamp < cutoff) {
                                 chatStore.delete(chat.chatId);
-                                messages.forEach(m => msgStore.delete(m.id));
-                                deletedCount++;
+                                messages.forEach((m) => msgStore.delete(m.id));
+                                deletedCount += 1;
                             }
-                            pendingChats--;
+                            pendingChats -= 1;
                             if (pendingChats === 0) resolve(deletedCount);
                         };
                         msgReq.onerror = () => {
-                            pendingChats--;
+                            pendingChats -= 1;
                             if (pendingChats === 0) resolve(deletedCount);
-                        }
+                        };
                     });
                 };
                 chatsReq.onerror = () => reject(chatsReq.error);
@@ -422,9 +415,9 @@
                     const cursor = e.target.result;
                     if (cursor) {
                         const msg = cursor.value;
-                        totalBytes += (msg.text ? msg.text.length : 0);
-                        totalBytes += (msg.role ? msg.role.length : 0);
-                        totalBytes += 100;
+                        totalBytes += (msg.text ? msg.text.length : 0) * 2;
+                        totalBytes += (msg.role ? msg.role.length : 0) * 2;
+                        totalBytes += 160;
                         cursor.continue();
                     } else {
                         resolve(totalBytes);
@@ -447,9 +440,6 @@
 
     const appDb = new DB();
 
-    // ======================================================================
-    // CORE ENGINE & STREAMING GUARD
-    // ======================================================================
     class Engine {
         constructor(db) {
             this.db = db;
@@ -459,27 +449,21 @@
             this.isArchiving = false;
             this.isScannerActive = false;
             this.hasFatalDbError = false;
-
-            // Streaming Guard
             this.pendingEntry = null;
             this.quietTimeout = null;
             this.lastKnownUserHash = '__ROOT__';
             this.hasConfirmedUserInCurrentPass = false;
-
-            // UI Callbacks
             this.onStateChange = () => {};
             this.onStatsUpdate = () => {};
-
-            // Internal cache for order
             this.currentMaxOrder = 0;
             this.currentMinOrder = Infinity;
-
-            // Strict Variant Hint
             this.pendingVariantHint = null;
         }
 
         resetCurrentChatState() {
             this.pendingEntry = null;
+            clearTimeout(this.quietTimeout);
+            this.quietTimeout = null;
             this.lastKnownUserHash = '__ROOT__';
             this.hasConfirmedUserInCurrentPass = false;
             this.currentMaxOrder = 0;
@@ -490,7 +474,6 @@
 
         setAdapter(adapterName) {
             let SelectedAdapter = PlatformAdapter;
-
             if (adapterName === 'Auto') {
                 if (location.hostname.includes('chatgpt.com')) SelectedAdapter = ChatGPTAdapter;
                 else if (location.hostname.includes('gemini.google.com')) SelectedAdapter = GeminiAdapter;
@@ -499,29 +482,23 @@
             } else if (adapterName === 'Gemini') {
                 SelectedAdapter = GeminiAdapter;
             }
-
             this.adapter = new SelectedAdapter();
             return this.adapter.constructor.name;
         }
 
         async updateCurrentChatId() {
             if (this.hasFatalDbError) return;
-
             let id = this.adapter.getChatId();
-
             if (!id) {
-                // Determine temp ID
                 let firstUserText = null;
                 const msgs = this.adapter.extractL1();
-                const userMsg = msgs.find(m => m.role === 'USER');
+                const userMsg = msgs.find((m) => m.role === 'USER');
                 if (userMsg) firstUserText = userMsg.text;
-
                 const rawTempId = this.adapter.getTempId(firstUserText);
                 id = await Utils.hash(rawTempId);
             }
 
             if (this.currentChatId && this.currentChatId !== id) {
-                // If old is hash (length 64) and new is NOT hash (stable), migrate!
                 if (this.currentChatId.length === 64 && id.length !== 64) {
                     await this.db.migrateChatId(this.currentChatId, id);
                 }
@@ -531,14 +508,12 @@
             this.lastKnownUserHash = '__ROOT__';
             this.hasConfirmedUserInCurrentPass = false;
 
-            // Re-sync order info
             const { min, max } = await this.db.getMinMaxOrder(this.currentChatId);
             this.currentMinOrder = min !== null ? min : Infinity;
             this.currentMaxOrder = max !== null ? max : 0;
 
             const chat = await this.db.getChat(this.currentChatId);
             const isEnabledForChat = chat ? (chat.isArchivingEnabled ?? false) : false;
-
             this.isArchiving = isEnabledForChat;
 
             await this.db.updateChat(this.currentChatId, {
@@ -547,8 +522,7 @@
                 isArchivingEnabled: this.isArchiving
             });
 
-            this.updateStats();
-
+            await this.updateStats();
             if (this.isArchiving) {
                 this.startObserverOnly();
             } else {
@@ -557,15 +531,16 @@
         }
 
         async updateStats() {
-            const chat = await this.db.getChat(this.currentChatId);
-            if (chat && chat.stats) {
-                this.onStatsUpdate(chat.stats.msgCount);
+            if (!this.currentChatId) {
+                this.onStatsUpdate(0);
+                return;
             }
+            const chat = await this.db.getChat(this.currentChatId);
+            this.onStatsUpdate(chat && chat.stats ? chat.stats.msgCount : 0);
         }
 
         async setArchiveForCurrentChat(enabled) {
             if (this.hasFatalDbError) return;
-
             if (!this.adapter.healthCheck()) {
                 this.onStateChange('ADAPTER MISMATCH');
                 return;
@@ -574,83 +549,71 @@
             if (this.currentChatId) {
                 await this.db.updateChat(this.currentChatId, { isArchivingEnabled: enabled });
             }
-
-            if (enabled) {
-                this.startObserverOnly();
-            } else {
-                await this.stopObserverOnly();
-            }
+            if (enabled) this.startObserverOnly();
+            else await this.stopObserverOnly();
         }
 
         startObserverOnly() {
             if (this.hasFatalDbError) return;
-
             if (!this.adapter.healthCheck()) {
                 this.onStateChange('ADAPTER MISMATCH');
                 return;
             }
             this.onStateChange('ARCHIVING');
             this.setupObserver();
-            this.runFullExtraction(); // Initial grab
+            this.runFullExtraction();
         }
 
         async stopObserverOnly({ flushPending = true, preserveState = false } = {}) {
-            if (!preserveState) {
-                this.onStateChange('IDLE');
-            }
+            if (!preserveState) this.onStateChange('IDLE');
             if (this.observer) {
                 this.observer.disconnect();
                 this.observer = null;
             }
-            if (flushPending) {
-                await this.flushPendingEntry('stop');
-            }
+            if (flushPending) await this.flushPendingEntry('stop');
         }
 
         setupObserver() {
             if (this.observer) this.observer.disconnect();
-
             const target = this.adapter.getObserverTarget();
             if (!target) return;
-
             this.observer = new MutationObserver((mutations) => {
                 this.handleMutations(mutations);
             });
-
             this.observer.observe(target, { childList: true, subtree: true, characterData: true });
         }
 
         async handleMutations(mutations) {
             if (this.hasFatalDbError || !this.isArchiving || this.isScannerActive) return;
 
-            // L3 Extraction First
+            const hasChildList = mutations.some((m) => m.type === 'childList' && ((m.addedNodes && m.addedNodes.length) || (m.removedNodes && m.removedNodes.length)));
             const l3Updates = this.adapter.extractL3FromMutations(mutations);
-            if (l3Updates.length > 0) {
-                for (const update of l3Updates) {
-                    await this.processMessage(update, 'AUTOSAVE');
-                }
-            } else {
-                // Fallback to debounced L1/L2
+            const unique = new Map();
+            for (const update of l3Updates) {
+                if (!update || !update.text) continue;
+                unique.set(`${update.role}:${update.nodeSignature}:${update.text.length}`, update);
+            }
+            for (const update of unique.values()) {
+                await this.processMessage(update, 'AUTOSAVE');
+            }
+
+            if (hasChildList) {
+                this.debouncedFullExtraction();
+            } else if (unique.size === 0) {
                 this.debouncedFullExtraction();
             }
         }
 
         debouncedFullExtraction = Utils.debounce(() => {
             this.runFullExtraction();
-        }, 1000);
+        }, 700);
 
         async runFullExtraction(source = 'AUTOSAVE') {
             if (this.hasFatalDbError || !this.adapter.healthCheck()) return;
-
             let msgs = this.adapter.extractL1();
-            if (msgs.length === 0) {
-                msgs = this.adapter.extractL2();
-            }
-
-            // Reset extraction pass context
+            if (msgs.length === 0) msgs = this.adapter.extractL2();
             this.lastKnownUserHash = '__ROOT__';
             this.hasConfirmedUserInCurrentPass = false;
-
             for (const msg of msgs) {
                 await this.processMessage(msg, source);
             }
@@ -658,49 +621,34 @@
 
         async processMessage(msgData, source, forcedArchiveOrder = null) {
             if (this.hasFatalDbError) return { inserted: false, archiveOrder: forcedArchiveOrder };
-            if (!msgData.text) return;
+            if (!msgData || !msgData.text) return { inserted: false, archiveOrder: forcedArchiveOrder };
 
             const textHash = await Utils.hash(msgData.text);
-
             let prevHash = '__UNKNOWN__';
-            if (msgData.role === 'USER') {
-                prevHash = this.lastKnownUserHash; // Point back to previous user msg or ROOT
-                this.lastKnownUserHash = textHash; // Update tail
-                this.hasConfirmedUserInCurrentPass = true;
 
-                // Finalize any pending assistant response immediately when user speaks
+            if (msgData.role === 'USER') {
+                prevHash = this.lastKnownUserHash;
+                this.lastKnownUserHash = textHash;
+                this.hasConfirmedUserInCurrentPass = true;
                 await this.flushPendingEntry('user_message');
             } else if (msgData.role === 'ASSISTANT') {
-                if (this.hasConfirmedUserInCurrentPass) {
-                    prevHash = this.lastKnownUserHash;
-                } else {
-                    prevHash = '__UNKNOWN__';
-                }
+                prevHash = this.hasConfirmedUserInCurrentPass ? this.lastKnownUserHash : '__UNKNOWN__';
             }
 
             const variantGroupId = prevHash;
             let variantIndex = 1;
-
             if (this.adapter.getCapabilities().supportsVariants && variantGroupId !== '__UNKNOWN__') {
-                const maxIdx = await this.db.getHighestVariantIndex(this.currentChatId, variantGroupId);
+                const maxIdx = await this.db.getHighestVariantIndex(this.currentChatId, variantGroupId, msgData.role);
                 if (maxIdx > 0) {
-                    const messagesForCtx = (await this.db.getMessages(this.currentChatId)).filter(m => m.variantGroupId === variantGroupId);
-                    const exactMatch = messagesForCtx.find(m => m.textHash === textHash);
-
+                    const messagesForCtx = (await this.db.getMessages(this.currentChatId)).filter((m) => m.variantGroupId === variantGroupId && m.role === msgData.role);
+                    const exactMatch = messagesForCtx.find((m) => m.textHash === textHash);
                     if (exactMatch) {
                         variantIndex = exactMatch.variantIndex;
+                    } else if (this.pendingVariantHint) {
+                        variantIndex = maxIdx + 1;
+                        this.pendingVariantHint = null;
                     } else {
-                        // We have different text for the same previous context.
-                        // We only branch if we have a strict, confirmed user action hint.
-                        if (this.pendingVariantHint) {
-                            variantIndex = maxIdx + 1;
-                            this.pendingVariantHint = null; // consume hint
-                        } else {
-                            // Same context, different text, but NO explicit variant hint.
-                            // To prevent creating duplicate/competing rows with the same variantIndex,
-                            // we safely skip insertion entirely unless there's a confirmed hint.
-                            return { inserted: false, archiveOrder: forcedArchiveOrder ?? this.currentMaxOrder };
-                        }
+                        return { inserted: false, archiveOrder: forcedArchiveOrder ?? this.currentMaxOrder };
                     }
                 }
             }
@@ -709,10 +657,10 @@
                 chatId: this.currentChatId,
                 role: msgData.role,
                 text: msgData.text,
-                textHash: textHash,
-                prevHash: prevHash,
-                variantGroupId: variantGroupId,
-                variantIndex: variantIndex,
+                textHash,
+                prevHash,
+                variantGroupId,
+                variantIndex,
                 dedupKey: `${this.currentChatId}:${msgData.role}:${textHash}:${prevHash}:${variantIndex}`,
                 captureTimestamp: Date.now(),
                 sourceType: source,
@@ -721,69 +669,59 @@
             };
 
             if (msgData.role === 'ASSISTANT' && source !== 'DEEPSCAN') {
-                return await this.handleStreamingGuard(record);
-            } else {
-                return await this.writeToDB(record);
+                return this.handleStreamingGuard(record);
             }
+            return this.writeToDB(record);
         }
 
         async handleStreamingGuard(record) {
-            // If cap doesn't support streaming guard, just write immediately
             if (!this.adapter.getCapabilities().supportsReliableStreamingDetection) {
-                return await this.writeToDB(record);
+                return this.writeToDB(record);
             }
-
             if (this.pendingEntry && this.pendingEntry.nodeSignature !== record.nodeSignature) {
-                // New assistant node appeared! Flush old one explicitly.
                 await this.flushPendingEntry('new_node');
             }
-
-            // Update pending node state in memory but do not write to DB yet.
-            // Even if the stream resumes after a pause, we just update the text content.
             this.pendingEntry = record;
-
             clearTimeout(this.quietTimeout);
             this.quietTimeout = setTimeout(() => {
-                // The quiet period is met. This is a finalization signal.
                 this.flushPendingEntry('quiet_period');
-            }, 1500);
-
+            }, 1200);
             return { inserted: false, archiveOrder: record.archiveOrder };
         }
 
         async flushPendingEntry(reason) {
-            if (this.pendingEntry) {
-                // console.log(`[Chronicler] Flushing pending entry. Reason: ${reason}`);
-                await this.writeToDB(this.pendingEntry);
-                this.pendingEntry = null;
-            }
+            if (!this.pendingEntry) return;
+            const pending = this.pendingEntry;
+            this.pendingEntry = null;
+            clearTimeout(this.quietTimeout);
+            this.quietTimeout = null;
+            await this.writeToDB(pending);
         }
 
         async writeToDB(record) {
-            // Determine archiveOrder
             if (record.archiveOrder === null || record.archiveOrder === undefined) {
-                // Not a deep scan forced order, just an append
                 this.currentMaxOrder += 100;
                 record.archiveOrder = this.currentMaxOrder;
             }
-
             try {
                 const result = await this.db.saveMessage(record);
                 if (result) {
-                    // It was actually inserted (not deduplicated)
-                    await this.db.updateChat(this.currentChatId, { title: document.title });
-                    this.updateStats();
-                    // Briefly show SAVED indicator
+                    await this.db.updateChat(this.currentChatId, { title: document.title, lastKnownUrl: location.href });
+                    await this.updateStats();
                     this.onStateChange('SAVED');
-                    setTimeout(() => { if(this.isArchiving && !this.isScannerActive) this.onStateChange('ARCHIVING'); }, 2000);
+                    setTimeout(() => {
+                        if (this.isArchiving && !this.isScannerActive && !this.hasFatalDbError) {
+                            this.onStateChange('ARCHIVING');
+                        }
+                    }, 1500);
                     return { inserted: true, archiveOrder: record.archiveOrder };
                 }
                 return { inserted: false, archiveOrder: record.archiveOrder };
             } catch (e) {
                 this.hasFatalDbError = true;
-                this.onStateChange('DB ERROR', "Failed to write message: " + e.message);
+                this.onStateChange('DB ERROR', `Failed to write message: ${e.message}`);
                 this.isArchiving = false;
-                await this.stopObserverOnly({ flushPending: false, preserveState: true }); // Abort archiving without recurse and preserve error state
+                await this.stopObserverOnly({ flushPending: false, preserveState: true });
                 return { inserted: false, archiveOrder: record.archiveOrder };
             }
         }
@@ -791,25 +729,19 @@
         async performDeepScan() {
             if (this.hasFatalDbError) return;
             if (this.isScannerActive) return;
-
             if (this.pendingEntry) {
-                console.warn("Cannot Deep Scan while assistant is streaming.");
+                console.warn('[Chronicler] cannot deep scan while assistant is streaming');
                 return;
             }
 
             const container = this.adapter.getScrollContainer();
-            if (!container) {
-                console.warn('[Chronicler] Deep Scan aborted: scroll container not found');
-                return;
-            }
+            if (!container) return;
 
             const originalScroll = container.scrollTop;
             const wasArchiving = this.isArchiving;
-
             this.isScannerActive = true;
-            this.isArchiving = false; // Disable normal archive
+            this.isArchiving = false;
             this.onStateChange('SCANNING');
-
             if (this.observer) this.observer.disconnect();
 
             let iterationsWithoutInserts = 0;
@@ -818,28 +750,27 @@
 
             try {
                 while (true) {
-                    if (Date.now() - startTime > 5 * 60 * 1000) break; // 5 min timeout
+                    if (Date.now() - startTime > 5 * 60 * 1000) break;
                     if (container.scrollTop === 0) {
-                        await new Promise(r => setTimeout(r, 2000));
-                        if (container.scrollTop === 0) break; // Truly at top
+                        await Utils.sleep(1500);
+                        if (container.scrollTop === 0) break;
                     }
 
                     container.scrollTop -= 1200;
-                    await new Promise(r => setTimeout(r, 1500)); // Wait for render
+                    await Utils.sleep(1200);
 
                     let msgs = this.adapter.extractL1();
                     if (msgs.length === 0) msgs = this.adapter.extractL2();
-
                     const n = msgs.length;
                     const insertedOrders = [];
 
-                    if (!Number.isFinite(this.currentMinOrder)) {
-                        this.lastKnownUserHash = '__ROOT__';
-                        this.hasConfirmedUserInCurrentPass = false;
+                    this.lastKnownUserHash = '__ROOT__';
+                    this.hasConfirmedUserInCurrentPass = false;
 
-                        for (let i = 0; i < n; i++) {
-                            const calculatedOrder = (i + 1) * 100;
-                            const result = await this.processMessage(msgs[i], 'DEEPSCAN', calculatedOrder);
+                    if (!Number.isFinite(this.currentMinOrder)) {
+                        for (let i = 0; i < n; i += 1) {
+                            const order = (i + 1) * 100;
+                            const result = await this.processMessage(msgs[i], 'DEEPSCAN', order);
                             if (result && result.inserted) insertedOrders.push(result.archiveOrder);
                         }
                         if (insertedOrders.length > 0) {
@@ -849,29 +780,22 @@
                             liveCount += insertedOrders.length;
                             this.onStateChange(`SCANNING [${liveCount}]`);
                         } else {
-                            iterationsWithoutInserts++;
+                            iterationsWithoutInserts += 1;
                         }
                     } else {
-                        this.lastKnownUserHash = '__ROOT__';
-                        this.hasConfirmedUserInCurrentPass = false;
-
-                        let baseOrder = this.currentMinOrder - (n * 100);
-                        for (let i = 0; i < n; i++) {
-                            const calculatedOrder = baseOrder + (i * 100);
-                            const result = await this.processMessage(msgs[i], 'DEEPSCAN', calculatedOrder);
-                            if (result && result.inserted) {
-                                insertedOrders.push(result.archiveOrder);
-                            }
+                        const baseOrder = this.currentMinOrder - n * 100;
+                        for (let i = 0; i < n; i += 1) {
+                            const order = baseOrder + i * 100;
+                            const result = await this.processMessage(msgs[i], 'DEEPSCAN', order);
+                            if (result && result.inserted) insertedOrders.push(result.archiveOrder);
                         }
-
                         if (insertedOrders.length > 0) {
-                            // update global minOrder by actual genuinely prepended minimum
                             this.currentMinOrder = Math.min(this.currentMinOrder, ...insertedOrders);
                             iterationsWithoutInserts = 0;
                             liveCount += insertedOrders.length;
                             this.onStateChange(`SCANNING [${liveCount}]`);
                         } else {
-                            iterationsWithoutInserts++;
+                            iterationsWithoutInserts += 1;
                         }
                     }
 
@@ -881,7 +805,6 @@
                 container.scrollTop = originalScroll;
                 this.isScannerActive = false;
                 this.isArchiving = wasArchiving;
-
                 if (!this.hasFatalDbError) {
                     if (wasArchiving) {
                         this.setupObserver();
@@ -890,15 +813,11 @@
                         this.onStateChange('IDLE');
                     }
                 }
-
-                this.updateStats();
+                await this.updateStats();
             }
         }
     }
 
-    // ======================================================================
-    // SPA ROUTE WATCHER
-    // ======================================================================
     class RouteWatcher {
         constructor(engine) {
             this.engine = engine;
@@ -907,66 +826,48 @@
         }
 
         start() {
-            // Document level click listener for soft variant hints
             document.body.addEventListener('click', (e) => {
                 const text = e.target.innerText || e.target.getAttribute('aria-label') || '';
                 const lowerText = text.toLowerCase();
-                // Both platforms use 'regenerate', 'edit', 'modify', etc.
                 if (lowerText.includes('regenerate') || lowerText.includes('edit') || lowerText.includes('modify')) {
                     this.engine.pendingVariantHint = true;
-                    // Reset hint if no new message appears quickly
-                    setTimeout(() => { this.engine.pendingVariantHint = null; }, 5000);
+                    setTimeout(() => {
+                        this.engine.pendingVariantHint = null;
+                    }, 5000);
                 }
             }, true);
 
-            // Overriding history API to catch SPA navigations
             const pushState = history.pushState;
-            history.pushState = function() {
+            history.pushState = function () {
                 pushState.apply(history, arguments);
-                window.dispatchEvent(new Event('pushstate'));
                 window.dispatchEvent(new Event('locationchange'));
             };
 
             const replaceState = history.replaceState;
-            history.replaceState = function() {
+            history.replaceState = function () {
                 replaceState.apply(history, arguments);
-                window.dispatchEvent(new Event('replacestate'));
                 window.dispatchEvent(new Event('locationchange'));
             };
 
-            window.addEventListener('popstate', () => {
-                window.dispatchEvent(new Event('locationchange'));
-            });
-
+            window.addEventListener('popstate', () => window.dispatchEvent(new Event('locationchange')));
             window.addEventListener('locationchange', () => this.handleRoute());
 
-            // Fallback interval for tricky SPAs that might not fire events perfectly
             this.checkInterval = setInterval(() => {
-                if (this.lastUrl !== location.href) {
-                    this.handleRoute();
-                }
+                if (this.lastUrl !== location.href) this.handleRoute();
             }, 2000);
 
-            // Initial boot
             this.handleRoute();
         }
 
         async handleRoute() {
             this.lastUrl = location.href;
-
-            // Safely flush any pending streams because we're navigating
             await this.engine.flushPendingEntry('route_change');
-
-            // updateCurrentChatId now reads DB and automatically starts/stops based on chat preference
             setTimeout(() => {
                 this.engine.updateCurrentChatId();
-            }, 1000); // Give DOM a second to mount so health check doesn't falsely fail
+            }, 1000);
         }
     }
 
-    // ======================================================================
-    // FLOATING UI & STATE MACHINE
-    // ======================================================================
     class FloatingUI {
         constructor(engine, performExport, performMarkdownExport, performJsonExport, performPartExport, performCopyAll) {
             this.engine = engine;
@@ -986,13 +887,11 @@
             this.createPanel();
             this.updateState(this.state);
             this.bindEvents();
-
-            this.engine.onStateChange = (state) => this.updateState(state);
+            this.engine.onStateChange = (state, reason) => this.updateState(state, reason);
             this.engine.onStatsUpdate = (count) => this.updateStats(count);
-
-            // Set initial engine
             const actualName = this.engine.setAdapter(this.savedOverride);
             this.updateEngineLabel(this.savedOverride, actualName);
+            this.updateDbSize();
         }
 
         createPanel() {
@@ -1002,6 +901,7 @@
                 if (opts.text !== undefined) el.textContent = opts.text;
                 if (opts.value !== undefined) el.value = opts.value;
                 if (opts.type) el.type = opts.type;
+                if (opts.title) el.title = opts.title;
                 if (opts.style) Object.assign(el.style, opts.style);
                 for (const child of children) {
                     if (child == null) continue;
@@ -1025,8 +925,7 @@
                     borderRadius: '8px',
                     zIndex: '99999',
                     boxShadow: '0 4px 6px rgba(0,0,0,0.3)',
-                    overflow: 'hidden',
-                    transition: 'height 0.2s'
+                    overflow: 'hidden'
                 }
             });
 
@@ -1048,33 +947,15 @@
 
             const body = make('div', {
                 id: 'chron-body',
-                style: {
-                    padding: '10px',
-                    display: this.isCollapsed ? 'none' : 'block'
-                }
+                style: { padding: '10px', display: this.isCollapsed ? 'none' : 'block' }
             });
 
-            const row1 = make('div', {
-                style: {
-                    marginBottom: '10px',
-                    display: 'flex',
-                    justifyContent: 'space-between',
-                    alignItems: 'center'
-                }
-            }, [
-                make('span', { text: 'Engine: ' }, [
-                    make('span', { id: 'chron-engine-label', text: 'Auto', style: { color: '#a6e3a1' } })
-                ]),
+            const row1 = make('div', { style: { marginBottom: '10px', display: 'flex', justifyContent: 'space-between', alignItems: 'center' } }, [
+                make('span', { text: 'Engine: ' }, [make('span', { id: 'chron-engine-label', text: 'Auto', style: { color: '#a6e3a1' } })]),
                 (() => {
                     const select = make('select', {
                         id: 'chron-engine-select',
-                        style: {
-                            background: '#313244',
-                            color: '#cdd6f4',
-                            border: 'none',
-                            borderRadius: '4px',
-                            padding: '2px'
-                        }
+                        style: { background: '#313244', color: '#cdd6f4', border: 'none', borderRadius: '4px', padding: '2px' }
                     });
                     select.append(
                         make('option', { value: 'Auto', text: 'Auto' }),
@@ -1085,14 +966,7 @@
                 })()
             ]);
 
-            const row2 = make('div', {
-                style: {
-                    marginBottom: '10px',
-                    display: 'flex',
-                    justifyContent: 'space-between',
-                    alignItems: 'center'
-                }
-            }, [
+            const row2 = make('div', { style: { marginBottom: '10px', display: 'flex', justifyContent: 'space-between', alignItems: 'center' } }, [
                 make('span', { id: 'chron-status', text: 'IDLE', style: { fontWeight: 'bold', color: '#89b4fa' } }),
                 make('label', { style: { display: 'flex', alignItems: 'center', cursor: 'pointer' } }, [
                     make('input', { id: 'chron-toggle', type: 'checkbox', style: { marginRight: '5px' } }),
@@ -1108,99 +982,41 @@
             ]);
 
             const row4 = make('div', { style: { display: 'flex', gap: '5px', marginBottom: '5px' } }, [
-                make('button', {
-                    id: 'chron-deep-scan',
-                    text: 'Deep Scan',
-                    title: 'Запустить глубокое сканирование страницы',
-                    style: {
-                        flex: '1', background: '#89b4fa', color: '#11111b', border: 'none',
-                        padding: '6px', borderRadius: '4px', cursor: 'pointer', fontWeight: 'bold'
-                    }
-                }),
-                make('button', {
-                    id: 'chron-copy-all',
-                    text: 'Copy All',
-                    title: 'Скопировать весь чат в буфер обмена',
-                    style: {
-                        flex: '1', background: '#f9e2af', color: '#11111b', border: 'none',
-                        padding: '6px', borderRadius: '4px', cursor: 'pointer', fontWeight: 'bold'
-                    }
-                })
+                make('button', { id: 'chron-deep-scan', text: 'Deep Scan', title: 'Запустить глубокое сканирование страницы', style: buttonStyle('#89b4fa', true) }),
+                make('button', { id: 'chron-copy-all', text: 'Copy All', title: 'Скопировать весь чат в буфер обмена', style: buttonStyle('#f9e2af', true) })
             ]);
 
             const row5 = make('div', { style: { display: 'flex', gap: '5px', marginBottom: '10px' } }, [
-                make('button', {
-                    id: 'chron-export',
-                    text: 'Export .txt',
-                    title: 'Экспорт в обычном текстовом формате',
-                    style: {
-                        flex: '1', background: '#a6e3a1', color: '#11111b', border: 'none',
-                        padding: '4px', borderRadius: '4px', cursor: 'pointer', fontSize: '11px'
-                    }
-                }),
-                make('button', {
-                    id: 'chron-export-md',
-                    text: 'Export .md',
-                    title: 'Экспорт в Markdown',
-                    style: {
-                        flex: '1', background: '#a6e3a1', color: '#11111b', border: 'none',
-                        padding: '4px', borderRadius: '4px', cursor: 'pointer', fontSize: '11px'
-                    }
-                }),
-                make('button', {
-                    id: 'chron-export-json',
-                    text: 'Export .json',
-                    title: 'Экспорт в JSON формате',
-                    style: {
-                        flex: '1', background: '#a6e3a1', color: '#11111b', border: 'none',
-                        padding: '4px', borderRadius: '4px', cursor: 'pointer', fontSize: '11px'
-                    }
-                }),
-                make('button', {
-                    id: 'chron-export-parts',
-                    text: 'Parts',
-                    title: 'Экспорт длинного чата по частям',
-                    style: {
-                        flex: '0.8', background: '#a6e3a1', color: '#11111b', border: 'none',
-                        padding: '4px', borderRadius: '4px', cursor: 'pointer', fontSize: '11px'
-                    }
-                })
+                make('button', { id: 'chron-export', text: 'Export .txt', title: 'Экспорт в обычном текстовом формате', style: buttonStyle('#a6e3a1') }),
+                make('button', { id: 'chron-export-md', text: 'Export .md', title: 'Экспорт в Markdown', style: buttonStyle('#a6e3a1') }),
+                make('button', { id: 'chron-export-json', text: 'Export .json', title: 'Экспорт в JSON формате', style: buttonStyle('#a6e3a1') }),
+                make('button', { id: 'chron-export-parts', text: 'Parts', title: 'Экспорт длинного чата по частям', style: { ...buttonStyle('#a6e3a1'), flex: '0.8' } })
             ]);
 
             const row6 = make('div', { style: { display: 'flex', gap: '5px' } }, [
-                make('button', {
-                    id: 'chron-del-chat',
-                    text: '🗑️ Текущий чат',
-                    title: 'Удалить текущий чат из базы',
-                    style: {
-                        flex: '1', background: '#f38ba8', color: '#11111b', border: 'none',
-                        padding: '4px', borderRadius: '4px', cursor: 'pointer', fontSize: '11px'
-                    }
-                }),
-                make('button', {
-                    id: 'chron-del-old',
-                    text: '🗑️ Старые (>30д)',
-                    title: 'Стереть архивы старше 30 дней',
-                    style: {
-                        flex: '1', background: '#f38ba8', color: '#11111b', border: 'none',
-                        padding: '4px', borderRadius: '4px', cursor: 'pointer', fontSize: '11px'
-                    }
-                })
+                make('button', { id: 'chron-del-chat', text: '🗑️ Текущий чат', title: 'Удалить текущий чат из базы', style: buttonStyle('#f38ba8') }),
+                make('button', { id: 'chron-del-old', text: '🗑️ Старые (>30д)', title: 'Стереть архивы старше 30 дней', style: buttonStyle('#f38ba8') })
             ]);
 
-            const error = make('div', {
-                id: 'chron-error-msg',
-                style: { color: '#f38ba8', marginTop: '8px', fontSize: '11px', display: 'none' }
-            });
-
+            const error = make('div', { id: 'chron-error-msg', style: { color: '#f38ba8', marginTop: '8px', fontSize: '11px', display: 'none' } });
             body.append(row1, row2, row3, row4, row5, row6, error);
             this.container.append(header, body);
+            (document.body || document.documentElement).appendChild(this.container);
 
-            const mountPoint = document.body || document.documentElement;
-            mountPoint.appendChild(this.container);
+            if (this.savedOverride) this.container.querySelector('#chron-engine-select').value = this.savedOverride;
 
-            if (this.savedOverride) {
-                this.container.querySelector('#chron-engine-select').value = this.savedOverride;
+            function buttonStyle(color, tall = false) {
+                return {
+                    flex: '1',
+                    background: color,
+                    color: '#11111b',
+                    border: 'none',
+                    padding: tall ? '6px' : '4px',
+                    borderRadius: '4px',
+                    cursor: 'pointer',
+                    fontWeight: tall ? 'bold' : 'normal',
+                    fontSize: tall ? '13px' : '11px'
+                };
             }
         }
 
@@ -1208,9 +1024,9 @@
             this.container.querySelector('#chron-header').addEventListener('click', (e) => {
                 if (e.target.id === 'chron-engine-select') return;
                 this.isCollapsed = !this.isCollapsed;
-                localStorage.setItem('ChroniclerCollapsed', this.isCollapsed);
+                localStorage.setItem('ChroniclerCollapsed', String(this.isCollapsed));
                 this.container.querySelector('#chron-body').style.display = this.isCollapsed ? 'none' : 'block';
-                this.container.querySelector('#chron-collapse').innerText = this.isCollapsed ? '[+]' : '[-]';
+                this.container.querySelector('#chron-collapse').textContent = this.isCollapsed ? '[+]' : '[-]';
             });
 
             this.container.querySelector('#chron-engine-select').addEventListener('change', (e) => {
@@ -1227,83 +1043,64 @@
                 this.engine.setArchiveForCurrentChat(e.target.checked);
             });
 
-            this.container.querySelector('#chron-deep-scan').addEventListener('click', () => {
+            this.container.querySelector('#chron-deep-scan').addEventListener('click', async () => {
                 if (this.engine.pendingEntry) {
-                    this.showError("Wait for assistant to finish before scanning.");
+                    this.showError('Wait for assistant to finish before scanning.');
                     return;
                 }
                 if (!this.engine.adapter.getCapabilities().supportsDeepScan) {
-                    this.showError("Deep Scan not supported on this platform.");
+                    this.showError('Deep Scan not supported on this platform.');
                     return;
                 }
                 const container = this.engine.adapter.getScrollContainer();
                 if (!container) {
-                    this.showError("Deep Scan failed: scroll container not found.");
+                    this.showError('Deep Scan failed: scroll container not found.');
                     return;
                 }
-                this.engine.performDeepScan();
+                await this.engine.performDeepScan();
+                this.updateDbSize();
             });
 
-            this.container.querySelector('#chron-export').addEventListener('click', () => {
-                this.performExport();
-            });
-
-            this.container.querySelector('#chron-export-md').addEventListener('click', () => {
-                this.performMarkdownExport();
-            });
-            this.container.querySelector('#chron-export-json').addEventListener('click', () => {
-                this.performJsonExport();
-            });
-            this.container.querySelector('#chron-export-parts').addEventListener('click', () => {
-                this.performPartExport();
-            });
-            this.container.querySelector('#chron-copy-all').addEventListener('click', (e) => {
-                this.performCopyAll(e.target);
-            });
+            this.container.querySelector('#chron-export').addEventListener('click', () => this.performExport());
+            this.container.querySelector('#chron-export-md').addEventListener('click', () => this.performMarkdownExport());
+            this.container.querySelector('#chron-export-json').addEventListener('click', () => this.performJsonExport());
+            this.container.querySelector('#chron-export-parts').addEventListener('click', () => this.performPartExport());
+            this.container.querySelector('#chron-copy-all').addEventListener('click', (e) => this.performCopyAll(e.target));
 
             this.container.querySelector('#chron-del-chat').addEventListener('click', async () => {
                 if (!this.engine.currentChatId) return;
-                if (window.confirm('Удалить архив текущего чата?')) {
-                    if (this.engine.isArchiving) {
-                        await this.engine.setArchiveForCurrentChat(false);
-                    }
-                    this.container.querySelector('#chron-toggle').checked = false;
-
-                    await this.engine.flushPendingEntry('delete_chat');
-
-                    const deletedId = this.engine.currentChatId;
-                    await appDb.deleteChat(deletedId);
-                    this.engine.resetCurrentChatState();
-
-                    await this.engine.updateCurrentChatId();
-                }
+                if (!window.confirm('Удалить архив текущего чата?')) return;
+                if (this.engine.isArchiving) await this.engine.setArchiveForCurrentChat(false);
+                this.container.querySelector('#chron-toggle').checked = false;
+                await this.engine.flushPendingEntry('delete_chat');
+                const deletedId = this.engine.currentChatId;
+                await appDb.deleteChat(deletedId);
+                this.engine.resetCurrentChatState();
+                await this.engine.updateCurrentChatId();
+                this.updateDbSize();
             });
 
             this.container.querySelector('#chron-del-old').addEventListener('click', async () => {
                 await this.engine.flushPendingEntry('delete_old');
-                if (window.confirm('Удалить архивы старше 30 дней (по дате последнего сообщения)?')) {
-                    const deleted = await appDb.clearOldArchives(30);
-                    if (this.engine.currentChatId) {
-                         const currentChat = await appDb.getChat(this.engine.currentChatId);
-                         if (!currentChat) {
-                             if (this.engine.isArchiving) {
-                                  await this.engine.setArchiveForCurrentChat(false);
-                             }
-                             this.container.querySelector('#chron-toggle').checked = false;
-                             this.engine.resetCurrentChatState();
-                             await this.engine.updateCurrentChatId();
-                         } else {
-                             await this.engine.updateCurrentChatId();
-                         }
+                if (!window.confirm('Удалить архивы старше 30 дней (по дате последнего сообщения)?')) return;
+                const deleted = await appDb.clearOldArchives(30);
+                if (this.engine.currentChatId) {
+                    const currentMessages = await appDb.getMessages(this.engine.currentChatId);
+                    if (currentMessages.length === 0) {
+                        if (this.engine.isArchiving) await this.engine.setArchiveForCurrentChat(false);
+                        this.container.querySelector('#chron-toggle').checked = false;
+                        this.engine.resetCurrentChatState();
                     }
-                    this.showError(`Удалено архивов: ${deleted}`);
+                    await this.engine.updateCurrentChatId();
                 }
+                this.updateDbSize();
+                this.showError(`Удалено архивов: ${deleted}`);
             });
         }
 
         updateEngineLabel(override, actual) {
             const label = override === 'Auto' ? `Auto (${actual.replace('Adapter', '')})` : override;
-            this.container.querySelector('#chron-engine-label').innerText = label;
+            this.container.querySelector('#chron-engine-label').textContent = label;
         }
 
         updateState(state, errorReason = null) {
@@ -1318,45 +1115,39 @@
             const copyAllBtn = this.container.querySelector('#chron-copy-all');
             const delChatBtn = this.container.querySelector('#chron-del-chat');
             const delOldBtn = this.container.querySelector('#chron-del-old');
-            const header = this.container.querySelector('#chron-header');
             const engineSelect = this.container.querySelector('#chron-engine-select');
+            const header = this.container.querySelector('#chron-header');
 
+            statusEl.textContent = state;
+            header.style.background = '#181825';
             this.hideError();
 
-            statusEl.innerText = state;
-
-            const disableAllActions = (disabled) => {
-                scanBtn.disabled = disabled && state !== 'SCANNING';
-                if (state === 'SCANNING' || state.startsWith('SCANNING')) {
-                    scanBtn.disabled = true;
-                }
-
-                const noChatOrEmpty = !this.engine.currentChatId || this.currentMsgCount === 0;
-
+            const noChatOrEmpty = !this.engine.currentChatId || this.currentMsgCount === 0;
+            const setActionState = (disabled) => {
+                scanBtn.disabled = disabled || state.startsWith('SCANNING');
                 exportBtn.disabled = disabled || noChatOrEmpty;
                 exportMdBtn.disabled = disabled || noChatOrEmpty;
                 exportJsonBtn.disabled = disabled || noChatOrEmpty;
                 exportPartsBtn.disabled = disabled || noChatOrEmpty;
                 copyAllBtn.disabled = disabled || noChatOrEmpty;
                 delChatBtn.disabled = disabled || noChatOrEmpty;
-
                 delOldBtn.disabled = disabled;
             };
 
             if (state.startsWith('SCANNING')) {
                 statusEl.style.color = '#f9e2af';
                 toggle.disabled = true;
-                disableAllActions(true);
+                setActionState(true);
                 engineSelect.disabled = true;
-            } else if (state === 'ADAPTER MISMATCH') {
+                return;
+            }
+
+            if (state === 'ADAPTER MISMATCH') {
                 statusEl.style.color = '#fab387';
                 toggle.checked = false;
                 toggle.disabled = false;
                 scanBtn.disabled = true;
-
-                // Keep exports available if DB is readable, otherwise disable
                 const canRead = this.engine.db.canRead();
-                const noChatOrEmpty = !this.engine.currentChatId || this.currentMsgCount === 0;
                 exportBtn.disabled = !canRead || noChatOrEmpty;
                 exportMdBtn.disabled = !canRead || noChatOrEmpty;
                 exportJsonBtn.disabled = !canRead || noChatOrEmpty;
@@ -1364,50 +1155,61 @@
                 copyAllBtn.disabled = !canRead || noChatOrEmpty;
                 delChatBtn.disabled = !canRead || noChatOrEmpty;
                 delOldBtn.disabled = !canRead;
-
                 engineSelect.disabled = false;
-                this.showError("Health check failed. Autosave blocked.");
-            } else if (state === 'DB ERROR') {
+                this.showError('Health check failed. Autosave blocked.');
+                return;
+            }
+
+            if (state === 'DB ERROR') {
                 header.style.background = '#721c24';
                 statusEl.style.color = '#f38ba8';
                 toggle.disabled = true;
-                disableAllActions(true);
-                // Specifically allow reading if possible even in error state
                 const canRead = this.engine.db.canRead();
-                const noChatOrEmpty = !this.engine.currentChatId || this.currentMsgCount === 0;
                 if (canRead) {
-                   exportBtn.disabled = noChatOrEmpty;
-                   exportMdBtn.disabled = noChatOrEmpty;
-                   exportJsonBtn.disabled = noChatOrEmpty;
-                   exportPartsBtn.disabled = noChatOrEmpty;
-                   copyAllBtn.disabled = noChatOrEmpty;
-                   delChatBtn.disabled = noChatOrEmpty;
-                   delOldBtn.disabled = false;
+                    exportBtn.disabled = noChatOrEmpty;
+                    exportMdBtn.disabled = noChatOrEmpty;
+                    exportJsonBtn.disabled = noChatOrEmpty;
+                    exportPartsBtn.disabled = noChatOrEmpty;
+                    copyAllBtn.disabled = noChatOrEmpty;
+                    delChatBtn.disabled = noChatOrEmpty;
+                    delOldBtn.disabled = false;
+                    scanBtn.disabled = true;
+                } else {
+                    setActionState(true);
                 }
-
                 engineSelect.disabled = true;
                 if (errorReason) this.showError(errorReason);
-            } else if (state === 'ARCHIVING') {
-                statusEl.style.color = '#a6e3a1';
-                toggle.disabled = false;
-                toggle.checked = true;
-                disableAllActions(false);
-                engineSelect.disabled = false;
-            } else if (state === 'SAVED') {
-                statusEl.style.color = '#89dceb';
-                disableAllActions(false);
-            } else { // IDLE
-                statusEl.style.color = '#89b4fa';
-                toggle.disabled = false;
-                toggle.checked = false;
-                disableAllActions(false);
-                engineSelect.disabled = false;
+                return;
             }
+
+            if (state === 'ARCHIVING') {
+                statusEl.style.color = '#a6e3a1';
+                toggle.checked = true;
+                toggle.disabled = false;
+                setActionState(false);
+                engineSelect.disabled = false;
+                return;
+            }
+
+            if (state === 'SAVED') {
+                statusEl.style.color = '#89dceb';
+                toggle.checked = !!this.engine.isArchiving;
+                toggle.disabled = false;
+                setActionState(false);
+                engineSelect.disabled = false;
+                return;
+            }
+
+            statusEl.style.color = '#89b4fa';
+            toggle.checked = false;
+            toggle.disabled = false;
+            setActionState(false);
+            engineSelect.disabled = false;
         }
 
         updateStats(count) {
-            this.container.querySelector('#chron-count').innerText = count;
             this.currentMsgCount = count;
+            this.container.querySelector('#chron-count').textContent = String(count);
             this.updateState(this.state);
             this.updateDbSize();
         }
@@ -1417,82 +1219,69 @@
                 const bytes = await appDb.calculateApproximateSize();
                 const mb = (bytes / (1024 * 1024)).toFixed(2);
                 const sizeEl = this.container.querySelector('#chron-size');
-                if (sizeEl) sizeEl.innerText = ` (${mb} MB)`;
-            } catch(e) { console.error(e); }
+                if (sizeEl) sizeEl.textContent = ` (${mb} MB)`;
+            } catch (e) {
+                console.error(e);
+            }
         }
 
         showError(msg) {
             const errEl = this.container.querySelector('#chron-error-msg');
-            errEl.innerText = msg;
+            errEl.textContent = msg;
             errEl.style.display = 'block';
-            setTimeout(() => { this.hideError(); }, 4000);
+            clearTimeout(this.errorTimer);
+            this.errorTimer = setTimeout(() => this.hideError(), 4000);
         }
 
         hideError() {
-            this.container.querySelector('#chron-error-msg').style.display = 'none';
+            const errEl = this.container.querySelector('#chron-error-msg');
+            errEl.style.display = 'none';
         }
     }
 
-    // ======================================================================
-    // EXPORT SYSTEM
-    // ======================================================================
+    function buildTextExportContent(chat, messages) {
+        const variantMap = {};
+        messages.forEach((m) => {
+            if (!variantMap[m.variantGroupId]) variantMap[m.variantGroupId] = new Set();
+            variantMap[m.variantGroupId].add(m.variantIndex);
+        });
+
+        let content = '======================================================================\n';
+        content += `TITLE: ${chat ? chat.title : document.title}\n`;
+        content += `URL: ${chat ? chat.lastKnownUrl : location.href}\n`;
+        content += `EXPORT DATE: ${new Date().toLocaleString()}\n`;
+        content += `MESSAGE COUNT: ${messages.length}\n`;
+        content += '======================================================================\n\n';
+
+        for (const msg of messages) {
+            const hasVariants = msg.variantGroupId !== '__UNKNOWN__' && variantMap[msg.variantGroupId] && variantMap[msg.variantGroupId].size > 1;
+            const versionStr = hasVariants ? ` | V${msg.variantIndex}` : '';
+            content += `[${msg.role}]${versionStr}\n`;
+            content += `${msg.text}\n\n`;
+            content += '----------------------------------------------------------------------\n\n';
+        }
+        return content;
+    }
+
     async function performExport(engine, ui) {
         await engine.flushPendingEntry('export');
         if (!engine.currentChatId) {
             ui.showError('No chat ID detected.');
             return;
         }
-
         const chat = await appDb.getChat(engine.currentChatId);
         const messages = await appDb.getMessages(engine.currentChatId);
-
         if (messages.length === 0) {
             ui.showError('Archive is empty. Enable archiving or run Deep Scan.');
             return;
         }
-
-        // Sort messages strictly by archiveOrder
         messages.sort((a, b) => a.archiveOrder - b.archiveOrder);
-
         const safeTitle = Utils.cleanTitle(chat ? chat.title : document.title);
         const shortId = engine.currentChatId.substring(0, 6);
         const dateStr = Utils.formatDate();
         const platform = location.hostname.includes('chatgpt.com') ? 'ChatGPT' : 'Gemini';
-
         const filename = `Archive_${platform}_${safeTitle}_${dateStr}_${shortId}.txt`;
-
-        let content = `======================================================================\n`;
-        content += `TITLE: ${chat ? chat.title : document.title}\n`;
-        content += `URL: ${chat ? chat.lastKnownUrl : location.href}\n`;
-        content += `EXPORT DATE: ${new Date().toLocaleString()}\n`;
-        content += `MESSAGE COUNT: ${messages.length}\n`;
-        content += `======================================================================\n\n`;
-
-        // Grouping for variants
-        const variantMap = {};
-        messages.forEach(m => {
-            if (!variantMap[m.variantGroupId]) variantMap[m.variantGroupId] = new Set();
-            variantMap[m.variantGroupId].add(m.variantIndex);
-        });
-
-        for (const msg of messages) {
-            const hasVariants = msg.variantGroupId !== '__UNKNOWN__' && variantMap[msg.variantGroupId] && variantMap[msg.variantGroupId].size > 1;
-            const versionStr = hasVariants ? ` | V${msg.variantIndex}` : '';
-
-            content += `[${msg.role}]${versionStr}\n`;
-            content += `${msg.text}\n\n`;
-            content += `----------------------------------------------------------------------\n\n`;
-        }
-
-        const blob = new Blob([content], { type: 'text/plain;charset=utf-8' });
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = filename;
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
-        URL.revokeObjectURL(url);
+        downloadBlob(new Blob([buildTextExportContent(chat, messages)], { type: 'text/plain;charset=utf-8' }), filename);
     }
 
     async function performMarkdownExport(engine, ui) {
@@ -1501,48 +1290,30 @@
             ui.showError('No chat ID detected.');
             return;
         }
-
         const chat = await appDb.getChat(engine.currentChatId);
         const messages = await appDb.getMessages(engine.currentChatId);
-
         if (messages.length === 0) {
             ui.showError('Archive is empty. Enable archiving or run Deep Scan.');
             return;
         }
-
         messages.sort((a, b) => a.archiveOrder - b.archiveOrder);
-
         const safeTitle = Utils.cleanTitle(chat ? chat.title : document.title);
         const shortId = engine.currentChatId.substring(0, 6);
         const dateStr = Utils.formatDate();
         const platform = location.hostname.includes('chatgpt.com') ? 'ChatGPT' : 'Gemini';
-
         const filename = `Archive_${platform}_${safeTitle}_${dateStr}_${shortId}.md`;
-
         let content = `# ${chat ? chat.title : document.title}\n\n`;
         content += `**URL:** ${chat ? chat.lastKnownUrl : location.href}\n`;
         content += `**Export Date:** ${new Date().toLocaleString()}\n`;
         content += `**Message Count:** ${messages.length}\n\n`;
-
         for (const msg of messages) {
             const d = new Date(msg.captureTimestamp);
             const hh = String(d.getHours()).padStart(2, '0');
             const mm = String(d.getMinutes()).padStart(2, '0');
-            const timeStr = `${hh}:${mm}`;
-
-            content += `**[${msg.role}]** (${timeStr}):\n`;
+            content += `**[${msg.role}]** (${hh}:${mm}):\n`;
             content += `${msg.text}\n\n`;
         }
-
-        const blob = new Blob([content], { type: 'text/markdown;charset=utf-8' });
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = filename;
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
-        URL.revokeObjectURL(url);
+        downloadBlob(new Blob([content], { type: 'text/markdown;charset=utf-8' }), filename);
     }
 
     async function performJsonExport(engine, ui) {
@@ -1551,29 +1322,23 @@
             ui.showError('No chat ID detected.');
             return;
         }
-
         const chat = await appDb.getChat(engine.currentChatId);
         const messages = await appDb.getMessages(engine.currentChatId);
-
         if (messages.length === 0) {
             ui.showError('Archive is empty. Enable archiving or run Deep Scan.');
             return;
         }
-
         messages.sort((a, b) => a.archiveOrder - b.archiveOrder);
-
         const platform = location.hostname.includes('chatgpt.com') ? 'ChatGPT' : 'Gemini';
-        const exportedAt = new Date().toISOString();
-
         const schema = {
-            version: "0.49e",
-            platform: platform,
+            version: '0.51',
+            platform,
             chatId: engine.currentChatId,
             title: chat ? chat.title : document.title,
             url: chat ? chat.lastKnownUrl : location.href,
-            exportedAt: exportedAt,
+            exportedAt: new Date().toISOString(),
             messageCount: messages.length,
-            messages: messages.map(m => ({
+            messages: messages.map((m) => ({
                 role: m.role,
                 text: m.text,
                 timestamp: new Date(m.captureTimestamp).toISOString(),
@@ -1581,21 +1346,11 @@
                 variantIndex: m.variantIndex
             }))
         };
-
         const safeTitle = Utils.cleanTitle(chat ? chat.title : document.title);
         const shortId = engine.currentChatId.substring(0, 6);
         const dateStr = Utils.formatDate();
         const filename = `Archive_${platform}_${safeTitle}_${dateStr}_${shortId}.json`;
-
-        const blob = new Blob([JSON.stringify(schema, null, 2)], { type: 'application/json;charset=utf-8' });
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = filename;
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
-        URL.revokeObjectURL(url);
+        downloadBlob(new Blob([JSON.stringify(schema, null, 2)], { type: 'application/json;charset=utf-8' }), filename);
     }
 
     async function performPartExport(engine, ui) {
@@ -1604,64 +1359,26 @@
             ui.showError('No chat ID detected.');
             return;
         }
-
         const chat = await appDb.getChat(engine.currentChatId);
         const messages = await appDb.getMessages(engine.currentChatId);
-
         if (messages.length === 0) {
             ui.showError('Archive is empty. Enable archiving or run Deep Scan.');
             return;
         }
-
         messages.sort((a, b) => a.archiveOrder - b.archiveOrder);
-
-        const variantMap = {};
-        messages.forEach(m => {
-            if (!variantMap[m.variantGroupId]) variantMap[m.variantGroupId] = new Set();
-            variantMap[m.variantGroupId].add(m.variantIndex);
-        });
-
         const safeTitle = Utils.cleanTitle(chat ? chat.title : document.title);
         const shortId = engine.currentChatId.substring(0, 6);
         const dateStr = Utils.formatDate();
         const platform = location.hostname.includes('chatgpt.com') ? 'ChatGPT' : 'Gemini';
-
         const CHUNK_SIZE = 200;
         const totalChunks = Math.ceil(messages.length / CHUNK_SIZE);
-
-        for (let i = 0; i < totalChunks; i++) {
-            const chunk = messages.slice(i * CHUNK_SIZE, (i + 1) * CHUNK_SIZE);
+        for (let i = 0; i < totalChunks; i += 1) {
             const partNum = i + 1;
+            const chunk = messages.slice(i * CHUNK_SIZE, (i + 1) * CHUNK_SIZE);
             const filename = `Archive_${platform}_${safeTitle}_${dateStr}_${shortId}_part${partNum}.txt`;
-
-            let content = `======================================================================\n`;
-            content += `TITLE: ${chat ? chat.title : document.title} (Part ${partNum}/${totalChunks})\n`;
-            content += `URL: ${chat ? chat.lastKnownUrl : location.href}\n`;
-            content += `EXPORT DATE: ${new Date().toLocaleString()}\n`;
-            content += `MESSAGE COUNT: ${chunk.length}\n`;
-            content += `======================================================================\n\n`;
-
-            for (const msg of chunk) {
-                const hasVariants = msg.variantGroupId !== '__UNKNOWN__' && variantMap[msg.variantGroupId] && variantMap[msg.variantGroupId].size > 1;
-                const versionStr = hasVariants ? ` | V${msg.variantIndex}` : '';
-
-                content += `[${msg.role}]${versionStr}\n`;
-                content += `${msg.text}\n\n`;
-                content += `----------------------------------------------------------------------\n\n`;
-            }
-
-            const blob = new Blob([content], { type: 'text/plain;charset=utf-8' });
-            const url = URL.createObjectURL(blob);
-            const a = document.createElement('a');
-            a.href = url;
-            a.download = filename;
-            document.body.appendChild(a);
-            a.click();
-            document.body.removeChild(a);
-            URL.revokeObjectURL(url);
-
-            // small delay to avoid browser blocking multiple downloads
-            await new Promise(r => setTimeout(r, 300));
+            const chunkChat = { ...(chat || {}), title: `${chat ? chat.title : document.title} (Part ${partNum}/${totalChunks})` };
+            downloadBlob(new Blob([buildTextExportContent(chunkChat, chunk)], { type: 'text/plain;charset=utf-8' }), filename);
+            await Utils.sleep(300);
         }
     }
 
@@ -1671,56 +1388,38 @@
             ui.showError('No chat ID detected.');
             return;
         }
-
         const chat = await appDb.getChat(engine.currentChatId);
         const messages = await appDb.getMessages(engine.currentChatId);
-
         if (messages.length === 0) {
             ui.showError('Archive is empty.');
             return;
         }
-
         messages.sort((a, b) => a.archiveOrder - b.archiveOrder);
-
-        const variantMap = {};
-        messages.forEach(m => {
-            if (!variantMap[m.variantGroupId]) variantMap[m.variantGroupId] = new Set();
-            variantMap[m.variantGroupId].add(m.variantIndex);
-        });
-
-        let content = `======================================================================\n`;
-        content += `TITLE: ${chat ? chat.title : document.title}\n`;
-        content += `URL: ${chat ? chat.lastKnownUrl : location.href}\n`;
-        content += `EXPORT DATE: ${new Date().toLocaleString()}\n`;
-        content += `MESSAGE COUNT: ${messages.length}\n`;
-        content += `======================================================================\n\n`;
-
-        for (const msg of messages) {
-            const hasVariants = msg.variantGroupId !== '__UNKNOWN__' && variantMap[msg.variantGroupId] && variantMap[msg.variantGroupId].size > 1;
-            const versionStr = hasVariants ? ` | V${msg.variantIndex}` : '';
-
-            content += `[${msg.role}]${versionStr}\n`;
-            content += `${msg.text}\n\n`;
-            content += `----------------------------------------------------------------------\n\n`;
-        }
-
         try {
-            await navigator.clipboard.writeText(content);
+            await navigator.clipboard.writeText(buildTextExportContent(chat, messages));
             const originalText = buttonEl.innerText;
-            buttonEl.innerText = "Copied!";
-            buttonEl.style.background = "#a6e3a1";
+            const originalBg = buttonEl.style.background;
+            buttonEl.innerText = 'Copied!';
+            buttonEl.style.background = '#a6e3a1';
             setTimeout(() => {
                 buttonEl.innerText = originalText;
-                buttonEl.style.background = "#f9e2af";
-            }, 2000);
+                buttonEl.style.background = originalBg;
+            }, 1800);
         } catch (e) {
-            ui.showError("Failed to copy limit or block");
+            ui.showError('Failed to copy text.');
         }
     }
 
-    // ======================================================================
-    // PLATFORM ADAPTERS
-    // ======================================================================
+    function downloadBlob(blob, filename) {
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = filename;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+    }
 
     class PlatformAdapter {
         detect() { return false; }
@@ -1729,7 +1428,7 @@
         getScrollContainer() { return null; }
         extractL1() { return []; }
         extractL2() { return []; }
-        extractL3FromMutations(mutations) { return []; }
+        extractL3FromMutations() { return []; }
         cleanText(text) { return text; }
         healthCheck() { return false; }
         getCapabilities() {
@@ -1740,13 +1439,9 @@
                 supportsStableRoleDetection: false
             };
         }
-
         getTempId(firstUserMessage = null) {
             const base = location.hostname + location.pathname;
-            if (firstUserMessage) {
-                return base + firstUserMessage; // Will be hashed by engine
-            }
-            return base + document.title;
+            return firstUserMessage ? base + firstUserMessage : base + document.title;
         }
     }
 
@@ -1757,22 +1452,28 @@
 
         getChatId() {
             const match = location.pathname.match(/\/c\/([a-zA-Z0-9-]+)/);
-            if (match) return match[1];
-            return null; // Signals engine to use temp ID
+            return match ? match[1] : null;
         }
 
         getObserverTarget() {
-            return document.querySelector('main .flex-1.overflow-hidden') || document.querySelector('main') || document.querySelector('[role="main"]') || document.body;
+            return document.querySelector('main .flex-1.overflow-hidden')
+                || document.querySelector('main [class*="overflow-hidden"]')
+                || document.querySelector('main')
+                || document.querySelector('[role="main"]')
+                || document.body;
         }
 
         getScrollContainer() {
-            return document.querySelector('main .flex-1.overflow-hidden .react-scroll-to-bottom--css-jjpys-1n7m0yu') || document.querySelector('main .overflow-y-auto') || document.querySelector('main [class*="overflow-y-auto"]') || document.querySelector('[class*="react-scroll-to-bottom"]') || document.scrollingElement || document.documentElement;
+            return document.querySelector('main [class*="overflow-y-auto"]')
+                || document.querySelector('[class*="react-scroll-to-bottom"]')
+                || document.scrollingElement
+                || document.documentElement;
         }
 
         healthCheck() {
             const target = this.getObserverTarget();
             const hasL1 = !!document.querySelector('[data-message-author-role]');
-            const hasL2 = !!document.querySelector('div.text-base, [data-testid^="conversation-turn-"], article');
+            const hasL2 = !!document.querySelector('[data-testid^="conversation-turn-"], div.text-base, article');
             return !!target && (hasL1 || hasL2);
         }
 
@@ -1785,86 +1486,147 @@
             };
         }
 
-        extractL1() {
-            const messages = [];
-            // Target distinct message blocks
-            document.querySelectorAll('[data-message-author-role]').forEach(el => {
-                const role = el.getAttribute('data-message-author-role').toUpperCase();
-                const id = el.getAttribute('data-message-id') || null;
-                const text = this.cleanText(Utils.normalizeText(el));
+        normalizeRole(role) {
+            if (!role) return null;
+            const lower = String(role).toLowerCase();
+            if (lower.includes('assistant') || lower.includes('chatgpt')) return 'ASSISTANT';
+            if (lower.includes('user') || lower.includes('you')) return 'USER';
+            if (lower.includes('system')) return 'SYSTEM';
+            return null;
+        }
 
-                // ChatGPT variant detection hint: "2/2" text
-                // Actually DOM usually has distinct divs, but relying on engine's prevHash mostly.
-                // For extraction, just return what's there
-                messages.push({
-                    node: el,
-                    role: role === 'ASSISTANT' ? 'ASSISTANT' : (role === 'USER' ? 'USER' : 'SYSTEM'),
-                    text: text,
-                    nodeSignature: id || el.className // use ID if available
-                });
+        detectRoleFromTurn(turnEl) {
+            if (!turnEl) return null;
+            const direct = turnEl.getAttribute && this.normalizeRole(turnEl.getAttribute('data-message-author-role'));
+            if (direct) return direct;
+
+            const nestedRole = turnEl.querySelector && turnEl.querySelector('[data-message-author-role]');
+            if (nestedRole) {
+                const nested = this.normalizeRole(nestedRole.getAttribute('data-message-author-role'));
+                if (nested) return nested;
+            }
+
+            if (turnEl.querySelector && turnEl.querySelector('[aria-label*="Edit message"], [data-testid*="edit"]')) return 'USER';
+            if (turnEl.querySelector && turnEl.querySelector('[aria-label*="Copy"], [aria-label*="Read aloud"], [aria-label*="Regenerate"]')) return 'ASSISTANT';
+
+            const rawText = (turnEl.innerText || turnEl.textContent || '').trim();
+            if (/^You\b/i.test(rawText)) return 'USER';
+            if (/^ChatGPT\b/i.test(rawText)) return 'ASSISTANT';
+            return null;
+        }
+
+        getConversationRoots() {
+            const roots = [];
+            const seen = new Set();
+            const add = (node) => {
+                if (!node || seen.has(node)) return;
+                seen.add(node);
+                roots.push(node);
+            };
+
+            document.querySelectorAll('[data-message-author-role]').forEach(add);
+            document.querySelectorAll('[data-testid^="conversation-turn-"]').forEach((turn) => {
+                const inner = turn.querySelector('[data-message-author-role]');
+                add(inner || turn);
             });
-            return messages;
+            return roots;
+        }
+
+        buildMessage(root, fallbackSignature = '') {
+            if (!root) return null;
+            const role = this.detectRoleFromTurn(root);
+            if (!role || role === 'SYSTEM') return null;
+            const text = this.cleanText(Utils.normalizeText(root));
+            if (!text) return null;
+            const nodeSignature = root.getAttribute('data-message-id')
+                || root.getAttribute('data-testid')
+                || root.id
+                || fallbackSignature
+                || root.className
+                || `${role}:${text.slice(0, 80)}`;
+            return { node: root, role, text, nodeSignature };
+        }
+
+        extractL1() {
+            return this.getConversationRoots()
+                .map((root, idx) => this.buildMessage(root, `chatgpt-l1-${idx}`))
+                .filter(Boolean);
         }
 
         extractL2() {
-            const messages = [];
-            // Fallback: look for generic chat bubbles
-            document.querySelectorAll('div.text-base').forEach(el => {
-                const text = this.cleanText(Utils.normalizeText(el));
-                if (!text) return;
-                const isUser = el.textContent.includes('You'); // basic hint
-                const role = isUser ? 'USER' : 'ASSISTANT';
-                messages.push({
-                    node: el,
-                    role: role,
-                    text: text,
-                    nodeSignature: el.className
-                });
+            const roots = [];
+            const seen = new Set();
+            const candidates = document.querySelectorAll('[data-testid^="conversation-turn-"], div.text-base, article');
+            candidates.forEach((node) => {
+                let root = node;
+                const nested = node.querySelector && node.querySelector('[data-message-author-role]');
+                if (nested) root = nested;
+                if (!seen.has(root)) {
+                    seen.add(root);
+                    roots.push(root);
+                }
             });
-            return messages;
+            return roots.map((root, idx) => this.buildMessage(root, `chatgpt-l2-${idx}`)).filter(Boolean);
+        }
+
+        collectCandidateRoots(node, outSet) {
+            if (!node) return;
+            const el = node.nodeType === Node.TEXT_NODE ? node.parentElement : node;
+            if (!el || el.nodeType !== Node.ELEMENT_NODE) return;
+
+            const direct = el.closest('[data-message-author-role]');
+            if (direct) outSet.add(direct);
+
+            const turn = el.closest('[data-testid^="conversation-turn-"]');
+            if (turn) {
+                const inner = turn.querySelector('[data-message-author-role]');
+                outSet.add(inner || turn);
+            }
+
+            if (el.matches && el.matches('[data-message-author-role], [data-testid^="conversation-turn-"]')) {
+                if (el.matches('[data-message-author-role]')) outSet.add(el);
+                else {
+                    const inner = el.querySelector('[data-message-author-role]');
+                    outSet.add(inner || el);
+                }
+            }
+
+            if (el.querySelector) {
+                el.querySelectorAll('[data-message-author-role]').forEach((n) => outSet.add(n));
+                el.querySelectorAll('[data-testid^="conversation-turn-"]').forEach((n) => {
+                    const inner = n.querySelector('[data-message-author-role]');
+                    outSet.add(inner || n);
+                });
+            }
         }
 
         extractL3FromMutations(mutations) {
-            const updates = [];
-            mutations.forEach(m => {
+            const candidates = new Set();
+            mutations.forEach((m) => {
                 if (m.type === 'characterData') {
-                    const el = m.target.parentElement?.closest('[data-message-author-role]');
-                    if (el && el.getAttribute('data-message-author-role') === 'assistant') {
-                        updates.push({
-                            node: el,
-                            role: 'ASSISTANT',
-                            text: this.cleanText(Utils.normalizeText(el)),
-                            nodeSignature: el.getAttribute('data-message-id') || el.className
-                        });
-                    }
-                } else if (m.type === 'childList') {
-                    m.addedNodes.forEach(node => {
-                        if (node.nodeType === Node.ELEMENT_NODE) {
-                            const el = node.closest ? node.closest('[data-message-author-role]') : null;
-                            if (el && el.getAttribute('data-message-author-role') === 'assistant') {
-                                updates.push({
-                                    node: el,
-                                    role: 'ASSISTANT',
-                                    text: this.cleanText(Utils.normalizeText(el)),
-                                    nodeSignature: el.getAttribute('data-message-id') || el.className
-                                });
-                            }
-                        }
-                    });
+                    this.collectCandidateRoots(m.target, candidates);
                 }
+                if (m.type === 'childList') {
+                    this.collectCandidateRoots(m.target, candidates);
+                    m.addedNodes.forEach((node) => this.collectCandidateRoots(node, candidates));
+                }
+            });
+            const updates = [];
+            candidates.forEach((root, idx) => {
+                const msg = this.buildMessage(root, `chatgpt-l3-${idx}`);
+                if (msg) updates.push(msg);
             });
             return updates;
         }
 
         cleanText(text) {
             if (!text) return text;
-            // ChatGPT specific artifact cleaning
             return text
-                .replace(/^You\n?/g, '') // remove trailing "You" prefix for user
-                .replace(/^ChatGPT\n?/g, '') // remove ChatGPT header
+                .replace(/^You\n?/g, '')
+                .replace(/^ChatGPT\n?/g, '')
                 .replace(/\n?Copied!$/g, '')
                 .replace(/\n?Copy code$/g, '')
-                .replace(/\n\d+\/\d+\n/g, '\n') // remove "1/2" variant counters
+                .replace(/\n\d+\/\d+\n/g, '\n')
                 .trim();
         }
     }
@@ -1876,16 +1638,23 @@
 
         getChatId() {
             const match = location.pathname.match(/\/app\/([a-zA-Z0-9]+)/);
-            if (match) return match[1];
-            return null;
+            return match ? match[1] : null;
         }
 
         getObserverTarget() {
-            return document.querySelector('message-list') || document.querySelector('.conversation-container') || document.querySelector('main') || document.querySelector('[role="main"]') || document.body;
+            return document.querySelector('message-list')
+                || document.querySelector('.conversation-container')
+                || document.querySelector('main')
+                || document.querySelector('[role="main"]')
+                || document.body;
         }
 
         getScrollContainer() {
-            return document.querySelector('.conversation-container') || document.querySelector('message-list') || document.querySelector('main [class*="scroll"]') || document.scrollingElement || document.documentElement;
+            return document.querySelector('.conversation-container')
+                || document.querySelector('message-list')
+                || document.querySelector('main [class*="scroll"]')
+                || document.scrollingElement
+                || document.documentElement;
         }
 
         healthCheck() {
@@ -1907,65 +1676,42 @@
 
         extractL1() {
             const messages = [];
-            // Target specific Gemini tags
-            const nodes = document.querySelectorAll('user-message, response-message, message-content');
-            nodes.forEach((el, index) => {
+            document.querySelectorAll('user-message, response-message, message-content').forEach((el, index) => {
                 const text = this.cleanText(Utils.normalizeText(el));
                 if (!text) return;
-
                 let role = 'RAW';
-                if (el.tagName.toLowerCase() === 'user-message') {
-                    role = 'USER';
-                } else if (el.tagName.toLowerCase() === 'response-message') {
-                    role = 'ASSISTANT';
-                } else {
-                    // Fallback positional
-                    role = index % 2 === 0 ? 'USER' : 'ASSISTANT';
-                }
-
-                messages.push({
-                    node: el,
-                    role: role,
-                    text: text,
-                    nodeSignature: el.id || `gemini-msg-${index}`
-                });
+                if (el.tagName.toLowerCase() === 'user-message') role = 'USER';
+                else if (el.tagName.toLowerCase() === 'response-message') role = 'ASSISTANT';
+                else role = index % 2 === 0 ? 'USER' : 'ASSISTANT';
+                messages.push({ node: el, role, text, nodeSignature: el.id || `gemini-msg-${index}` });
             });
             return messages;
         }
 
         extractL2() {
             const messages = [];
-            // Fallback: look for text blocks
-            const nodes = document.querySelectorAll('.message-content, .model-response-text');
-            nodes.forEach((el, index) => {
+            document.querySelectorAll('.message-content, .model-response-text').forEach((el, index) => {
                 const text = this.cleanText(Utils.normalizeText(el));
                 if (!text) return;
-
                 const isUser = !el.classList.contains('model-response-text');
-                messages.push({
-                    node: el,
-                    role: isUser ? 'USER' : 'ASSISTANT',
-                    text: text,
-                    nodeSignature: `gemini-l2-${index}`
-                });
+                messages.push({ node: el, role: isUser ? 'USER' : 'ASSISTANT', text, nodeSignature: `gemini-l2-${index}` });
             });
             return messages;
         }
 
         extractL3FromMutations(mutations) {
             const updates = [];
-            mutations.forEach(m => {
-                if (m.type === 'characterData' || m.type === 'childList') {
-                    const target = m.target.nodeType === Node.TEXT_NODE ? m.target.parentElement : m.target;
-                    const el = target.closest('response-message, .model-response-text');
-                    if (el) {
-                        updates.push({
-                            node: el,
-                            role: 'ASSISTANT',
-                            text: this.cleanText(Utils.normalizeText(el)),
-                            nodeSignature: el.id || 'gemini-streaming'
-                        });
-                    }
+            mutations.forEach((m) => {
+                if (m.type !== 'characterData' && m.type !== 'childList') return;
+                const target = m.target.nodeType === Node.TEXT_NODE ? m.target.parentElement : m.target;
+                const assistantEl = target && target.closest ? target.closest('response-message, .model-response-text') : null;
+                if (assistantEl) {
+                    updates.push({
+                        node: assistantEl,
+                        role: 'ASSISTANT',
+                        text: this.cleanText(Utils.normalizeText(assistantEl)),
+                        nodeSignature: assistantEl.id || 'gemini-streaming'
+                    });
                 }
             });
             return updates;
@@ -1983,14 +1729,10 @@
         }
     }
 
-    // ======================================================================
-    // BOOTSTRAP
-    // ======================================================================
-
     const bootstrap = async () => {
         const engine = new Engine(appDb);
-        // We create the UI first so it can handle DB Init errors properly via its state machine
-        const ui = new FloatingUI(engine,
+        const ui = new FloatingUI(
+            engine,
             () => performExport(engine, ui),
             () => performMarkdownExport(engine, ui),
             () => performJsonExport(engine, ui),
@@ -2002,14 +1744,13 @@
         try {
             await appDb.init();
             const routeWatcher = new RouteWatcher(engine);
-            routeWatcher.start(); // This triggers initial chat ID setup
+            routeWatcher.start();
         } catch (e) {
-            console.error("Chronicler DB Error:", e);
+            console.error('[Chronicler] DB Error:', e);
             engine.hasFatalDbError = true;
-            engine.onStateChange('DB ERROR', "IndexedDB Error: " + (e.message || "Init Failed"));
+            engine.onStateChange('DB ERROR', `IndexedDB Error: ${e.message || 'Init Failed'}`);
         }
     };
 
     bootstrap();
-
 })();
