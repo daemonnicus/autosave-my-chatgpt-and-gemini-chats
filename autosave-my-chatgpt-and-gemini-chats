@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         Writer's Chat Chronicler v0.53
+// @name         Writer's Chat Chronicler v0.58
 // @namespace    http://tampermonkey.net/
-// @version      0.53
+// @version      0.58
 // @description  Local archiver for long-form creative conversations.
 // @author       You
 // @match        *://chatgpt.com/*
@@ -17,7 +17,7 @@
 (function () {
     'use strict';
 
-    console.log('[Chronicler 0.53] loaded on', location.href);
+    console.log('[Chronicler 0.58] loaded on', location.href);
 
     const Utils = {
         async hash(string) {
@@ -458,6 +458,7 @@
             this.currentMaxOrder = 0;
             this.currentMinOrder = Infinity;
             this.pendingVariantHint = null;
+            this.abortDeepScan = false;
         }
 
         resetCurrentChatState() {
@@ -619,9 +620,11 @@
             }
         }
 
-        async processMessage(msgData, source, forcedArchiveOrder = null) {
+        async processMessage(msgData, source, forcedArchiveOrder = null, lockedChatId = null) {
             if (this.hasFatalDbError) return { inserted: false, archiveOrder: forcedArchiveOrder };
             if (!msgData || !msgData.text) return { inserted: false, archiveOrder: forcedArchiveOrder };
+            
+            const targetChatId = lockedChatId || this.currentChatId;
 
             const textHash = await Utils.hash(msgData.text);
             let prevHash = '__UNKNOWN__';
@@ -643,14 +646,14 @@
                     ...this.pendingEntry, 
                     text: msgData.text, 
                     textHash, 
-                    dedupKey: `${this.currentChatId}:${msgData.role}:${textHash}:${prevHash}:${this.pendingEntry.variantIndex}`
+                    dedupKey: `${targetChatId}:${msgData.role}:${textHash}:${prevHash}:${this.pendingEntry.variantIndex}`
                 });
             }
 
             if (this.adapter.getCapabilities().supportsVariants && variantGroupId !== '__UNKNOWN__') {
-                const maxIdx = await this.db.getHighestVariantIndex(this.currentChatId, variantGroupId, msgData.role);
+                const maxIdx = await this.db.getHighestVariantIndex(targetChatId, variantGroupId, msgData.role);
                 if (maxIdx > 0) {
-                    const messagesForCtx = (await this.db.getMessages(this.currentChatId)).filter((m) => m.variantGroupId === variantGroupId && m.role === msgData.role);
+                    const messagesForCtx = (await this.db.getMessages(targetChatId)).filter((m) => m.variantGroupId === variantGroupId && m.role === msgData.role);
                     const exactMatch = messagesForCtx.find((m) => m.textHash === textHash);
                     if (exactMatch) {
                         variantIndex = exactMatch.variantIndex;
@@ -664,14 +667,14 @@
             }
 
             const record = {
-                chatId: this.currentChatId,
+                chatId: targetChatId,
                 role: msgData.role,
                 text: msgData.text,
                 textHash,
                 prevHash,
                 variantGroupId,
                 variantIndex,
-                dedupKey: `${this.currentChatId}:${msgData.role}:${textHash}:${prevHash}:${variantIndex}`,
+                dedupKey: `${targetChatId}:${msgData.role}:${textHash}:${prevHash}:${variantIndex}`,
                 captureTimestamp: Date.now(),
                 sourceType: source,
                 nodeSignature: msgData.nodeSignature,
@@ -716,14 +719,16 @@
             try {
                 const result = await this.db.saveMessage(record);
                 if (result) {
-                    await this.db.updateChat(this.currentChatId, { title: document.title, lastKnownUrl: location.href });
-                    await this.updateStats();
-                    this.onStateChange('SAVED');
-                    setTimeout(() => {
-                        if (this.isArchiving && !this.isScannerActive && !this.hasFatalDbError) {
-                            this.onStateChange('ARCHIVING');
-                        }
-                    }, 1500);
+                    await this.db.updateChat(record.chatId, { title: document.title, lastKnownUrl: location.href });
+                    if (record.chatId === this.currentChatId) {
+                        await this.updateStats();
+                        this.onStateChange('SAVED');
+                        setTimeout(() => {
+                            if (this.isArchiving && !this.isScannerActive && !this.hasFatalDbError && !this.abortDeepScan) {
+                                this.onStateChange('ARCHIVING');
+                            }
+                        }, 1500);
+                    }
                     return { inserted: true, archiveOrder: record.archiveOrder };
                 }
                 return { inserted: false, archiveOrder: record.archiveOrder };
@@ -753,6 +758,7 @@
             const wasArchiving = this.isArchiving;
             this.isScannerActive = true;
             this.isArchiving = false;
+            this.abortDeepScan = false;
             this.onStateChange('SCANNING');
             if (this.observer) this.observer.disconnect();
 
@@ -776,8 +782,12 @@
 
                     if (!Number.isFinite(this.currentMinOrder)) {
                         for (let i = 0; i < n; i += 1) {
+                            if (location.pathname !== originalPath || this.abortDeepScan) {
+                                iterationsWithoutInserts = 999;
+                                break;
+                            }
                             const order = (i + 1) * 100;
-                            const result = await this.processMessage(msgs[i], 'DEEPSCAN', order);
+                            const result = await this.processMessage(msgs[i], 'DEEPSCAN', order, originalChatId);
                             if (result && result.inserted) insertedOrders.push(result.archiveOrder);
                         }
                         if (insertedOrders.length > 0) {
@@ -792,8 +802,12 @@
                     } else {
                         const baseOrder = this.currentMinOrder - n * 100;
                         for (let i = 0; i < n; i += 1) {
+                            if (location.pathname !== originalPath || this.abortDeepScan) {
+                                iterationsWithoutInserts = 999;
+                                break;
+                            }
                             const order = baseOrder + i * 100;
-                            const result = await this.processMessage(msgs[i], 'DEEPSCAN', order);
+                            const result = await this.processMessage(msgs[i], 'DEEPSCAN', order, originalChatId);
                             if (result && result.inserted) insertedOrders.push(result.archiveOrder);
                         }
                         if (insertedOrders.length > 0) {
@@ -806,26 +820,36 @@
                         }
                     }
 
-                    if (iterationsWithoutInserts >= 3) break;
+                    if (iterationsWithoutInserts >= 15) {
+                        console.warn('[Chronicler] DeepScan exceeded 15 dry iterations. Breaking to prevent infinite freeze.');
+                        break;
+                    }
 
                     if (container.scrollTop === 0) {
-                        await Utils.sleep(1500);
+                        container.scrollTop = 10;
+                        await Utils.sleep(50);
+                        container.scrollTop = 0;
+                        await Utils.sleep(3000);
                         if (container.scrollTop === 0) break;
                     }
 
-                    container.scrollTop -= 1200;
+                    container.scrollTop -= 1500;
                     await Utils.sleep(1200);
                 }
             } finally {
                 container.scrollTop = originalScroll;
                 this.isScannerActive = false;
-                this.isArchiving = wasArchiving;
-                if (!this.hasFatalDbError) {
-                    if (wasArchiving) {
-                        this.setupObserver();
-                        this.onStateChange('ARCHIVING');
-                    } else {
-                        this.onStateChange('IDLE');
+                if (this.abortDeepScan || location.pathname !== originalPath || this.currentChatId !== originalChatId) {
+                    console.warn('[Chronicler] DeepScan aborted cleanly without re-arming observer.');
+                } else {
+                    this.isArchiving = wasArchiving;
+                    if (!this.hasFatalDbError) {
+                        if (wasArchiving) {
+                            this.setupObserver();
+                            this.onStateChange('ARCHIVING');
+                        } else {
+                            this.onStateChange('IDLE');
+                        }
                     }
                 }
                 await this.updateStats();
@@ -836,7 +860,7 @@
     class RouteWatcher {
         constructor(engine) {
             this.engine = engine;
-            this.lastUrl = location.href;
+            this.lastUrl = null;
             this.checkInterval = null;
         }
 
@@ -875,7 +899,12 @@
         }
 
         async handleRoute() {
-            this.lastUrl = location.href;
+            const newUrl = location.href;
+            if (this.lastUrl === newUrl) return;
+            this.lastUrl = newUrl;
+            if (this.engine.isScannerActive) {
+                this.engine.abortDeepScan = true;
+            }
             await this.engine.flushPendingEntry('route_change');
             setTimeout(() => {
                 this.engine.updateCurrentChatId();
@@ -1346,7 +1375,7 @@
         messages.sort((a, b) => a.archiveOrder - b.archiveOrder);
         const platform = location.hostname.includes('chatgpt.com') ? 'ChatGPT' : 'Gemini';
         const schema = {
-            version: '0.53',
+            version: '0.58',
             platform,
             chatId: engine.currentChatId,
             title: chat ? chat.title : document.title,
@@ -1479,6 +1508,17 @@
         }
 
         getScrollContainer() {
+            const msgs = document.querySelectorAll('[data-testid^="conversation-turn-"], [data-message-author-role]');
+            if (msgs.length > 0) {
+                let curr = msgs[msgs.length - 1].parentElement;
+                while (curr && curr !== document.body && curr !== document.documentElement) {
+                    const style = window.getComputedStyle(curr);
+                    if (style.overflowY === 'auto' || style.overflowY === 'scroll') {
+                        return curr;
+                    }
+                    curr = curr.parentElement;
+                }
+            }
             return document.querySelector('main [class*="overflow-y-auto"]')
                 || document.querySelector('[class*="react-scroll-to-bottom"]')
                 || document.scrollingElement
@@ -1665,6 +1705,17 @@
         }
 
         getScrollContainer() {
+            const msgs = document.querySelectorAll('user-message, response-message, message-content, model-response, user-query');
+            if (msgs.length > 0) {
+                let curr = msgs[msgs.length - 1].parentElement;
+                while (curr && curr !== document.body && curr !== document.documentElement) {
+                    const style = window.getComputedStyle(curr);
+                    if (style.overflowY === 'auto' || style.overflowY === 'scroll') {
+                        return curr;
+                    }
+                    curr = curr.parentElement;
+                }
+            }
             return document.querySelector('.conversation-container')
                 || document.querySelector('message-list')
                 || document.querySelector('main [class*="scroll"]')
