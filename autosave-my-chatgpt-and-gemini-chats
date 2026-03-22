@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         Writer's Chat Chronicler v0.51
+// @name         Writer's Chat Chronicler v0.52
 // @namespace    http://tampermonkey.net/
-// @version      0.51
+// @version      0.52
 // @description  Local archiver for long-form creative conversations.
 // @author       You
 // @match        *://chatgpt.com/*
@@ -17,7 +17,7 @@
 (function () {
     'use strict';
 
-    console.log('[Chronicler 0.51] loaded on', location.href);
+    console.log('[Chronicler 0.52] loaded on', location.href);
 
     const Utils = {
         async hash(string) {
@@ -637,6 +637,16 @@
 
             const variantGroupId = prevHash;
             let variantIndex = 1;
+
+            if (msgData.role === 'ASSISTANT' && source !== 'DEEPSCAN' && this.pendingEntry && this.pendingEntry.nodeSignature === msgData.nodeSignature) {
+                return this.handleStreamingGuard({ 
+                    ...this.pendingEntry, 
+                    text: msgData.text, 
+                    textHash, 
+                    dedupKey: `${this.currentChatId}:${msgData.role}:${textHash}:${prevHash}:${this.pendingEntry.variantIndex}`
+                });
+            }
+
             if (this.adapter.getCapabilities().supportsVariants && variantGroupId !== '__UNKNOWN__') {
                 const maxIdx = await this.db.getHighestVariantIndex(this.currentChatId, variantGroupId, msgData.role);
                 if (maxIdx > 0) {
@@ -751,13 +761,6 @@
             try {
                 while (true) {
                     if (Date.now() - startTime > 5 * 60 * 1000) break;
-                    if (container.scrollTop === 0) {
-                        await Utils.sleep(1500);
-                        if (container.scrollTop === 0) break;
-                    }
-
-                    container.scrollTop -= 1200;
-                    await Utils.sleep(1200);
 
                     let msgs = this.adapter.extractL1();
                     if (msgs.length === 0) msgs = this.adapter.extractL2();
@@ -800,6 +803,14 @@
                     }
 
                     if (iterationsWithoutInserts >= 3) break;
+
+                    if (container.scrollTop === 0) {
+                        await Utils.sleep(1500);
+                        if (container.scrollTop === 0) break;
+                    }
+
+                    container.scrollTop -= 1200;
+                    await Utils.sleep(1200);
                 }
             } finally {
                 container.scrollTop = originalScroll;
@@ -1331,7 +1342,7 @@
         messages.sort((a, b) => a.archiveOrder - b.archiveOrder);
         const platform = location.hostname.includes('chatgpt.com') ? 'ChatGPT' : 'Gemini';
         const schema = {
-            version: '0.51',
+            version: '0.52',
             platform,
             chatId: engine.currentChatId,
             title: chat ? chat.title : document.title,
