@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         Writer's Chat Chronicler v0.52
+// @name         Writer's Chat Chronicler v0.53
 // @namespace    http://tampermonkey.net/
-// @version      0.52
+// @version      0.53
 // @description  Local archiver for long-form creative conversations.
 // @author       You
 // @match        *://chatgpt.com/*
@@ -17,7 +17,7 @@
 (function () {
     'use strict';
 
-    console.log('[Chronicler 0.52] loaded on', location.href);
+    console.log('[Chronicler 0.53] loaded on', location.href);
 
     const Utils = {
         async hash(string) {
@@ -748,6 +748,8 @@
             if (!container) return;
 
             const originalScroll = container.scrollTop;
+            const originalPath = location.pathname;
+            const originalChatId = this.currentChatId;
             const wasArchiving = this.isArchiving;
             this.isScannerActive = true;
             this.isArchiving = false;
@@ -761,6 +763,8 @@
             try {
                 while (true) {
                     if (Date.now() - startTime > 5 * 60 * 1000) break;
+                    if (location.pathname !== originalPath) break;
+                    if (this.currentChatId !== originalChatId) break;
 
                     let msgs = this.adapter.extractL1();
                     if (msgs.length === 0) msgs = this.adapter.extractL2();
@@ -1342,7 +1346,7 @@
         messages.sort((a, b) => a.archiveOrder - b.archiveOrder);
         const platform = location.hostname.includes('chatgpt.com') ? 'ChatGPT' : 'Gemini';
         const schema = {
-            version: '0.52',
+            version: '0.53',
             platform,
             chatId: engine.currentChatId,
             title: chat ? chat.title : document.title,
