@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         Writer's Chat Chronicler v0.58
+// @name         Writer's Chat Chronicler v0.59
 // @namespace    http://tampermonkey.net/
-// @version      0.58
+// @version      0.59
 // @description  Local archiver for long-form creative conversations.
 // @author       You
 // @match        *://chatgpt.com/*
@@ -17,7 +17,7 @@
 (function () {
     'use strict';
 
-    console.log('[Chronicler 0.58] loaded on', location.href);
+    console.log('[Chronicler 0.59] loaded on', location.href);
 
     const Utils = {
         async hash(string) {
@@ -641,7 +641,7 @@
             const variantGroupId = prevHash;
             let variantIndex = 1;
 
-            if (msgData.role === 'ASSISTANT' && source !== 'DEEPSCAN' && this.pendingEntry && this.pendingEntry.nodeSignature === msgData.nodeSignature) {
+            if (msgData.role === 'ASSISTANT' && source !== 'DEEPSCAN' && source !== 'HARVEST' && this.pendingEntry && this.pendingEntry.nodeSignature === msgData.nodeSignature) {
                 return this.handleStreamingGuard({ 
                     ...this.pendingEntry, 
                     text: msgData.text, 
@@ -681,7 +681,7 @@
                 archiveOrder: forcedArchiveOrder
             };
 
-            if (msgData.role === 'ASSISTANT' && source !== 'DEEPSCAN') {
+            if (msgData.role === 'ASSISTANT' && source !== 'DEEPSCAN' && source !== 'HARVEST') {
                 return this.handleStreamingGuard(record);
             }
             return this.writeToDB(record);
@@ -841,6 +841,136 @@
                 this.isScannerActive = false;
                 if (this.abortDeepScan || location.pathname !== originalPath || this.currentChatId !== originalChatId) {
                     console.warn('[Chronicler] DeepScan aborted cleanly without re-arming observer.');
+                } else {
+                    this.isArchiving = wasArchiving;
+                    if (!this.hasFatalDbError) {
+                        if (wasArchiving) {
+                            this.setupObserver();
+                            this.onStateChange('ARCHIVING');
+                        } else {
+                            this.onStateChange('IDLE');
+                        }
+                    }
+                }
+                await this.updateStats();
+            }
+        }
+
+        async performHarvest() {
+            if (this.hasFatalDbError) return;
+            if (this.isScannerActive) return;
+            if (this.pendingEntry) {
+                console.warn('[Chronicler] cannot harvest while assistant is streaming');
+                return;
+            }
+
+            const container = this.adapter.getScrollContainer();
+            if (!container) return;
+
+            const originalScroll = container.scrollTop;
+            const originalPath = location.pathname;
+            const originalChatId = this.currentChatId;
+            const wasArchiving = this.isArchiving;
+            this.isScannerActive = true;
+            this.isArchiving = false;
+            this.abortDeepScan = false;
+            this.onStateChange('HARVESTING');
+            if (this.observer) this.observer.disconnect();
+
+            const isGemini = this.adapter.constructor.name === 'GeminiAdapter' || location.hostname.includes('gemini');
+            const waitTime = isGemini ? 3000 : 1800;
+            const scrollStep = isGemini ? 250 : 350;
+            const requiredStableCycles = isGemini ? 10 : 6;
+
+            let stableCycles = 0;
+            let lastScrollTop = -1;
+            let lastScrollHeight = -1;
+            let lastRootCount = -1;
+            let lastTopNodeSig = null;
+            let lastDbCount = -1;
+
+            const startTime = Date.now();
+            let liveCount = 0;
+
+            try {
+                while (true) {
+                    if (Date.now() - startTime > 15 * 60 * 1000) break;
+                    if (location.pathname !== originalPath) break;
+                    if (this.currentChatId !== originalChatId) break;
+                    if (this.abortDeepScan) break;
+
+                    let msgs = this.adapter.extractL1();
+                    if (msgs.length === 0) msgs = this.adapter.extractL2();
+                    const currentRootCount = msgs.length;
+                    const topNodeSig = currentRootCount > 0 ? (msgs[0].nodeSignature || msgs[0].textHash) : null;
+
+                    this.lastKnownUserHash = '__ROOT__';
+                    this.hasConfirmedUserInCurrentPass = false;
+
+                    const insertedOrders = [];
+                    for (let i = 0; i < msgs.length; i += 1) {
+                        if (location.pathname !== originalPath || this.abortDeepScan) break;
+                        const order = Number.isFinite(this.currentMinOrder) 
+                                      ? (this.currentMinOrder - msgs.length * 100 + i * 100)
+                                      : ((i + 1) * 100);
+
+                        const result = await this.processMessage(msgs[i], 'HARVEST', order, originalChatId);
+                        if (result && result.inserted) insertedOrders.push(result.archiveOrder);
+                    }
+
+                    if (insertedOrders.length > 0) {
+                        this.currentMinOrder = Math.min(Number.isFinite(this.currentMinOrder) ? this.currentMinOrder : Infinity, ...insertedOrders);
+                        this.currentMaxOrder = Math.max(this.currentMaxOrder, ...insertedOrders);
+                        liveCount += insertedOrders.length;
+                        this.onStateChange(`HARVESTING [${liveCount}]`);
+                    }
+
+                    const dbCountReq = await this.db.getChat(originalChatId);
+                    const currentDbCount = dbCountReq && dbCountReq.stats ? dbCountReq.stats.msgCount : 0;
+
+                    const currentScrollTop = container.scrollTop;
+                    const currentScrollHeight = container.scrollHeight;
+
+                    const progressChanged = 
+                        currentScrollTop !== lastScrollTop ||
+                        currentScrollHeight !== lastScrollHeight ||
+                        currentRootCount !== lastRootCount ||
+                        topNodeSig !== lastTopNodeSig ||
+                        currentDbCount !== lastDbCount;
+
+                    if (progressChanged) {
+                        stableCycles = 0;
+                    } else {
+                        stableCycles += 1;
+                    }
+
+                    lastScrollTop = currentScrollTop;
+                    lastScrollHeight = currentScrollHeight;
+                    lastRootCount = currentRootCount;
+                    lastTopNodeSig = topNodeSig;
+                    lastDbCount = currentDbCount;
+
+                    if (stableCycles >= requiredStableCycles) {
+                        console.log('[Chronicler] Harvest reached stable state after multiple cycles.');
+                        break;
+                    }
+
+                    if (container.scrollTop === 0) {
+                        container.scrollTop = 10;
+                        await Utils.sleep(50);
+                        container.scrollTop = 0;
+                        await Utils.sleep(waitTime * 1.5);
+                    } else {
+                        container.scrollTop -= scrollStep;
+                        await Utils.sleep(waitTime);
+                    }
+                }
+            } finally {
+                await this.flushPendingEntry('harvest_complete');
+                container.scrollTop = originalScroll;
+                this.isScannerActive = false;
+                if (this.abortDeepScan || location.pathname !== originalPath || this.currentChatId !== originalChatId) {
+                    console.warn('[Chronicler] Harvest aborted cleanly without re-arming observer.');
                 } else {
                     this.isArchiving = wasArchiving;
                     if (!this.hasFatalDbError) {
@@ -1026,7 +1156,8 @@
             ]);
 
             const row4 = make('div', { style: { display: 'flex', gap: '5px', marginBottom: '5px' } }, [
-                make('button', { id: 'chron-deep-scan', text: 'Deep Scan', title: 'Запустить глубокое сканирование страницы', style: buttonStyle('#89b4fa', true) }),
+                make('button', { id: 'chron-deep-scan', text: 'Deep Scan', title: 'Быстрое глубокое сканирование', style: buttonStyle('#89b4fa', true) }),
+                make('button', { id: 'chron-harvest', text: 'Harvest', title: 'Медленный, надежный сбор всей истории', style: buttonStyle('#cba6f7', true) }),
                 make('button', { id: 'chron-copy-all', text: 'Copy All', title: 'Скопировать весь чат в буфер обмена', style: buttonStyle('#f9e2af', true) })
             ]);
 
@@ -1105,6 +1236,24 @@
                 this.updateDbSize();
             });
 
+            this.container.querySelector('#chron-harvest').addEventListener('click', async () => {
+                if (this.engine.pendingEntry) {
+                    this.showError('Wait for assistant to finish before harvesting.');
+                    return;
+                }
+                if (!this.engine.adapter.getCapabilities().supportsDeepScan) {
+                    this.showError('Harvest not supported on this platform.');
+                    return;
+                }
+                const container = this.engine.adapter.getScrollContainer();
+                if (!container) {
+                    this.showError('Harvest failed: scroll container not found.');
+                    return;
+                }
+                await this.engine.performHarvest();
+                this.updateDbSize();
+            });
+
             this.container.querySelector('#chron-export').addEventListener('click', () => this.performExport());
             this.container.querySelector('#chron-export-md').addEventListener('click', () => this.performMarkdownExport());
             this.container.querySelector('#chron-export-json').addEventListener('click', () => this.performJsonExport());
@@ -1152,6 +1301,7 @@
             const statusEl = this.container.querySelector('#chron-status');
             const toggle = this.container.querySelector('#chron-toggle');
             const scanBtn = this.container.querySelector('#chron-deep-scan');
+            const harvestBtn = this.container.querySelector('#chron-harvest');
             const exportBtn = this.container.querySelector('#chron-export');
             const exportMdBtn = this.container.querySelector('#chron-export-md');
             const exportJsonBtn = this.container.querySelector('#chron-export-json');
@@ -1168,7 +1318,9 @@
 
             const noChatOrEmpty = !this.engine.currentChatId || this.currentMsgCount === 0;
             const setActionState = (disabled) => {
-                scanBtn.disabled = disabled || state.startsWith('SCANNING');
+                const isScanningOrHarvesting = state.startsWith('SCANNING') || state.startsWith('HARVESTING');
+                scanBtn.disabled = disabled || isScanningOrHarvesting;
+                harvestBtn.disabled = disabled || isScanningOrHarvesting;
                 exportBtn.disabled = disabled || noChatOrEmpty;
                 exportMdBtn.disabled = disabled || noChatOrEmpty;
                 exportJsonBtn.disabled = disabled || noChatOrEmpty;
@@ -1186,11 +1338,20 @@
                 return;
             }
 
+            if (state.startsWith('HARVESTING')) {
+                statusEl.style.color = '#cba6f7';
+                toggle.disabled = true;
+                setActionState(true);
+                engineSelect.disabled = true;
+                return;
+            }
+
             if (state === 'ADAPTER MISMATCH') {
                 statusEl.style.color = '#fab387';
                 toggle.checked = false;
                 toggle.disabled = false;
                 scanBtn.disabled = true;
+                harvestBtn.disabled = true;
                 const canRead = this.engine.db.canRead();
                 exportBtn.disabled = !canRead || noChatOrEmpty;
                 exportMdBtn.disabled = !canRead || noChatOrEmpty;
@@ -1218,6 +1379,7 @@
                     delChatBtn.disabled = noChatOrEmpty;
                     delOldBtn.disabled = false;
                     scanBtn.disabled = true;
+                    harvestBtn.disabled = true;
                 } else {
                     setActionState(true);
                 }
@@ -1375,7 +1537,7 @@
         messages.sort((a, b) => a.archiveOrder - b.archiveOrder);
         const platform = location.hostname.includes('chatgpt.com') ? 'ChatGPT' : 'Gemini';
         const schema = {
-            version: '0.58',
+            version: '0.59',
             platform,
             chatId: engine.currentChatId,
             title: chat ? chat.title : document.title,
